@@ -67,9 +67,18 @@ def hw_to_dataset_features(
     joint_fts = {
         key: ftype
         for key, ftype in hw_features.items()
-        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        if ftype is float
+        or (
+            isinstance(ftype, PolicyFeature)
+            and ftype.type not in (FeatureType.VISUAL, FeatureType.SENSOR)
+        )
     }
     cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
+    sensor_fts = {
+        key: pf
+        for key, pf in hw_features.items()
+        if isinstance(pf, PolicyFeature) and pf.type == FeatureType.SENSOR
+    }
 
     if joint_fts and prefix == ACTION:
         features[prefix] = {
@@ -92,6 +101,20 @@ def hw_to_dataset_features(
             "names": ["height", "width", "channels"],
         }
 
+    for key, pf in sensor_fts.items():
+        if len(pf.shape) == 2:
+            dim_names = ["time", "axis"]
+        elif len(pf.shape) == 1:
+            dim_names = ["axis"]
+        else:
+            dim_names = [f"dim_{i}" for i in range(len(pf.shape))]
+        feature_key = key if key.startswith(f"{prefix}.") else f"{prefix}.sensors.{key}"
+        features[feature_key] = {
+            "dtype": "float32",
+            "shape": pf.shape,
+            "names": dim_names,
+        }
+        
     _validate_feature_names(features)
     return features
 

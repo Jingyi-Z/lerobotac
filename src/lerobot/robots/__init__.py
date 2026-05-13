@@ -17,5 +17,13 @@
 from .config import RobotConfig
 from .robot import Robot
 from .utils import make_robot_from_config
+from .so_sensor_follower import SOSensorFollower, SOSensorFollowerConfig
 
-__all__ = ["Robot", "RobotConfig", "make_robot_from_config"]
+
+__all__ = [
+    "Robot",
+    "RobotConfig",
+    "SOSensorFollower",
+    "SOSensorFollowerConfig",
+    "make_robot_from_config",
+]
