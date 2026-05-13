@@ -144,7 +144,12 @@ def build_dataset_frame(
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
-
+        elif ft["dtype"] == "float32" and len(ft["shape"]) >= 2:
+            # Sensor features: stored as multidimensional float32 arrays.
+            # The value in `values` is already a numpy array of the right shape
+            # (produced by SOSensorFollower.get_observation), so we just pass
+            # it through with explicit dtype enforcement.
+            frame[key] = np.asarray(values[key], dtype=np.float32)
     return frame
 
 
