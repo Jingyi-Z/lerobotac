@@ -25,6 +25,28 @@
 
 🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
 
+
+## About this fork
+
+`lerobotac` extends Hugging Face LeRobot with a generic sensor framework
+(`FeatureType.SENSOR`) and a concrete MLX90393 Hall-effect magnetometer
+driver for tactile sensing on the SO-101 follower. Documentation lives in
+the companion repo:
+
+- Hardware setup and dataset workflow: [robotics_notes](https://github.com/Jingyi-Z/robotics_notes)
+- Tactile sensor integration: [robotics_notes/docs/06_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md)
+
+### Branches
+
+- `main` — tracks upstream `huggingface/lerobot`
+- `hall-sensor` — adds the sensor framework and the MLX90393 driver
+
+### Adding a new sensor
+
+See [robotics_notes/docs/06_tactile_sensor.md §7](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md). New
+sensors require one new file (`src/lerobot/sensors/<name>.py`) plus a
+config registration and a factory entry; no other framework code changes.
+
 ## Quick Start
 
 LeRobot can be installed directly from PyPI.
