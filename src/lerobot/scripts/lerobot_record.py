@@ -339,6 +339,12 @@ def record(
     )
 
     robot = make_robot_from_config(cfg.robot)
+    if hasattr(robot, "wait_for_sensor_calibration"):
+        results = robot.wait_for_sensor_calibration(timeout_s=10.0)
+        for name, ok in results.items():
+            if not ok:
+                raise RuntimeError(f"Sensor '{name}' calibration timed out after 10s.")
+            logging.info(f"Sensor '{name}' calibrated.")
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
