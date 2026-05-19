@@ -76,6 +76,19 @@ class PaxiniSensor(Sensor):
         self._rerun_anatomy_logged: bool = False
         self._rerun_log_path: Optional[str] = None
 
+        # The dict key from --robot.sensors={NAME: ...}, set by the factory in
+        # make_sensors_from_configs(). Used to log under
+        # `observation.sensors.{name}/...` so the 3D point cloud appears in
+        # lerobot's auto-built rerun Blueprint panel for this sensor.
+        self._sensor_name: Optional[str] = None
+
+    def set_sensor_name(self, name: str) -> None:
+        """Called by ``make_sensors_from_configs`` so the sensor knows the
+        dict key it lives under (e.g. ``paxini_fingertip``). Must be called
+        before ``connect()`` for the rerun log path to use the correct
+        Blueprint namespace."""
+        self._sensor_name = name
+
     # ---- properties --------------------------------------------------------
 
     @property
@@ -161,8 +174,19 @@ class PaxiniSensor(Sensor):
                 variant = sensor_registry.find_by_point_count(self._n_taxels)
                 if variant is not None:
                     self._rerun_coords = sensor_registry.load_points(variant)
-                    safe_name = module_name.lower().replace("-", "_")
-                    self._rerun_log_path = f"sensor/{safe_name}"
+                    # Log under the lerobot Blueprint's auto-built namespace
+                    # for this sensor so the 3D point cloud joins the existing
+                    # `observation.sensors.{sensor_name}` panel. Fall back to
+                    # the legacy `sensor/{module_name}` path only if the
+                    # factory didn't set a name on us (e.g. direct
+                    # instantiation in scripts).
+                    if self._sensor_name:
+                        self._rerun_log_path = (
+                            f"observation.sensors.{self._sensor_name}"
+                        )
+                    else:
+                        safe_name = module_name.lower().replace("-", "_")
+                        self._rerun_log_path = f"sensor/{safe_name}"
                     logging.info(
                         f"Paxini: rerun 3D point cloud enabled for "
                         f"{variant.vendor_part_code} at '{self._rerun_log_path}'"

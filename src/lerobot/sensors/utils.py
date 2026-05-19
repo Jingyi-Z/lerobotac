@@ -26,7 +26,12 @@ def make_sensors_from_configs(sensor_configs: dict[str, SensorConfig]) -> dict[s
             sensors[key] = MLX90393Sensor(cfg)
         elif cfg.type == "paxini":
             from .paxini import PaxiniSensor
-            sensors[key] = PaxiniSensor(cfg)
+            sensor = PaxiniSensor(cfg)
+            # Tell the sensor the dict key it lives under so its rerun log
+            # path can use `observation.sensors.{key}/...`, slotting into the
+            # lerobot Blueprint panel auto-built for this sensor.
+            sensor.set_sensor_name(key)
+            sensors[key] = sensor
         else:
             raise ValueError(
                 f"Unknown sensor type {cfg.type!r} for sensor {key!r}. "
