@@ -106,6 +106,26 @@ def log_rerun_data(
                 if arr.ndim == 1:
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
+                elif arr.ndim == 2 and arr.shape[-1] <= 16:
+                    # Sensor ring buffer of shape (N, D): log most-recent
+                    # frame's D channels as animated scalars instead of a
+                    # static image. Works for MLX (N, 3) and Paxini resultant.
+                    latest = arr[-1]
+                    for i, vi in enumerate(latest):
+                        rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
+                elif arr.ndim == 3 and arr.shape[-1] == 3:
+                    # Tactile grid of shape (N, P, 3): log most-recent frame's
+                    # Fz channel as an animated heatmap, plus the per-axis
+                    # sum across taxels as scalars.
+                    latest = arr[-1]                          # (P, 3)
+                    fz_col = latest[:, 2:3].reshape(-1, 1)    # (P, 1)
+                    if compress_images:
+                        rr.log(f"{key}/fz", rr.Image(fz_col).compress())
+                    else:
+                        rr.log(f"{key}/fz", rr.Image(fz_col))
+                    rr.log(f"{key}/sum_fx", rr.Scalars(float(latest[:, 0].sum())))
+                    rr.log(f"{key}/sum_fy", rr.Scalars(float(latest[:, 1].sum())))
+                    rr.log(f"{key}/sum_fz", rr.Scalars(float(latest[:, 2].sum())))
                 else:
                     img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
                     rr.log(key, entity=img_entity, static=True)
