@@ -273,26 +273,37 @@ class PaxiniSensor(Sensor):
             if not pts_n:
                 return
             if not self._rerun_anatomy_logged:
-                grey = [(200, 205, 210)] * len(self._rerun_coords)
+                # Faint backdrop so the user always sees the fingertip shape
+                # even when nothing is touching. Tiny radii so the dynamic
+                # `distributed` dots dominate visually when contact happens.
+                pale = [(180, 185, 195)] * len(self._rerun_coords)
                 rr.log(
                     f"{self._rerun_log_path}/anatomy",
                     rr.Points3D(positions=self._rerun_coords,
-                                 colors=grey, radii=0.4),
+                                 colors=pale, radii=0.15),
                     static=True,
                 )
                 self._rerun_anatomy_logged = True
 
+            # High-contrast hue shift (blue → red) keyed to abs(Fz). The
+            # vendor's 0.1 N/LSB resolution means light contact is roughly
+            # 0.2-0.4 N; we saturate at 0.5 N so a fingertip press already
+            # paints the cloud red. Radii blow up to 3.0 at saturation so
+            # contact area is unmistakable.
             n = min(len(pts_n), len(self._rerun_coords))
             colors = []
             radii = []
+            SAT_N = 0.5  # Fz at which color/radius is fully saturated
             for i in range(n):
-                fz = pts_n[i][2]
-                t = max(0.0, min(1.0, fz / 3.0))
-                r = round(230 + (24 - 230) * t)
-                g = round(241 + (95 - 241) * t)
-                b = round(251 + (165 - 251) * t)
+                fz = abs(pts_n[i][2])
+                t = max(0.0, min(1.0, fz / SAT_N))
+                # Cold (rest)   = (40, 110, 220)   blue
+                # Hot  (contact)= (230, 40, 40)    red
+                r = round(40 + (230 - 40) * t)
+                g = round(110 + (40 - 110) * t)
+                b = round(220 + (40 - 220) * t)
                 colors.append((r, g, b))
-                radii.append(0.4 + min(1.5, max(0.0, fz * 0.5)))
+                radii.append(0.3 + 2.7 * t)
             rr.log(
                 f"{self._rerun_log_path}/distributed",
                 rr.Points3D(positions=self._rerun_coords[:n],
