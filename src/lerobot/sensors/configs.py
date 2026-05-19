@@ -91,3 +91,11 @@ class PaxiniSensorConfig(SensorConfig):
     # connect and subtract from subsequent samples — useful for trimming
     # residual ~1 LSB offset for sub-LSB precision work.
     software_baseline_frames: int = 0
+
+    # If True, the sensor's read thread logs a 3D point-cloud of the 52
+    # tactile points (positions from paxini_sdk.sensor_registry) into the
+    # active rerun session on every frame. Color = Fz magnitude. Gives the
+    # same fingertip-shaped visualization as `paxini-rerun`, inside the
+    # `lerobot-record --display_data=true` viewer. Best-effort: if rerun
+    # isn't initialized yet, the calls silently no-op.
+    display_rerun: bool = False

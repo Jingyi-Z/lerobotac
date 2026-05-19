@@ -71,6 +71,11 @@ class PaxiniSensor(Sensor):
         self._sw_baseline: Optional[np.ndarray] = None
         self._sw_baseline_buf: list[np.ndarray] = []
 
+        # Cached anatomy coords for the optional rerun display path
+        self._rerun_coords: Optional[list] = None
+        self._rerun_anatomy_logged: bool = False
+        self._rerun_log_path: Optional[str] = None
+
     # ---- properties --------------------------------------------------------
 
     @property
@@ -149,6 +154,23 @@ class PaxiniSensor(Sensor):
             f"output={self.config.output_format})"
         )
 
+        # Pre-load anatomy coords if rerun display is enabled
+        if self.config.display_rerun:
+            try:
+                from paxini_sdk import sensor_registry
+                variant = sensor_registry.find_by_point_count(self._n_taxels)
+                if variant is not None:
+                    self._rerun_coords = sensor_registry.load_points(variant)
+                    safe_name = module_name.lower().replace("-", "_")
+                    self._rerun_log_path = f"sensor/{safe_name}"
+                    logging.info(
+                        f"Paxini: rerun 3D point cloud enabled for "
+                        f"{variant.vendor_part_code} at '{self._rerun_log_path}'"
+                    )
+            except Exception as e:
+                logging.warning(f"Paxini: rerun coords unavailable ({e}); "
+                                "the display_rerun flag is a no-op.")
+
     def disconnect(self) -> None:
         self.stop_continuous_read()
         if self._hand is not None:
@@ -207,8 +229,59 @@ class PaxiniSensor(Sensor):
                     sample = sample - self._sw_baseline
                 with self._data_lock:
                     self._ring.append(sample)
+                if self.config.display_rerun:
+                    self._log_to_rerun(frame, module_name)
         except Exception as e:
             logging.exception(f"Paxini read loop terminated: {e}")
+
+    def _log_to_rerun(self, frame, module_name: str) -> None:
+        """Push a 3D point cloud of the 52 tactile points to rerun, plus
+        per-axis sum-of-forces scalars. Safe no-op if rerun isn't running
+        or the anatomy coordinates weren't loaded."""
+        if self._rerun_coords is None or self._rerun_log_path is None:
+            return
+        try:
+            import rerun as rr
+        except ImportError:
+            return
+        try:
+            pts_n = frame.distributed_forces_newtons.get(module_name)
+            if not pts_n:
+                return
+            if not self._rerun_anatomy_logged:
+                grey = [(200, 205, 210)] * len(self._rerun_coords)
+                rr.log(
+                    f"{self._rerun_log_path}/anatomy",
+                    rr.Points3D(positions=self._rerun_coords,
+                                 colors=grey, radii=0.4),
+                    static=True,
+                )
+                self._rerun_anatomy_logged = True
+
+            n = min(len(pts_n), len(self._rerun_coords))
+            colors = []
+            radii = []
+            for i in range(n):
+                fz = pts_n[i][2]
+                t = max(0.0, min(1.0, fz / 3.0))
+                r = round(230 + (24 - 230) * t)
+                g = round(241 + (95 - 241) * t)
+                b = round(251 + (165 - 251) * t)
+                colors.append((r, g, b))
+                radii.append(0.4 + min(1.5, max(0.0, fz * 0.5)))
+            rr.log(
+                f"{self._rerun_log_path}/distributed",
+                rr.Points3D(positions=self._rerun_coords[:n],
+                             colors=colors, radii=radii),
+            )
+
+            res_n = frame.resultant_forces_newtons.get(module_name)
+            if res_n is not None:
+                rr.log(f"{self._rerun_log_path}/resultant/fx", rr.Scalars(res_n[0]))
+                rr.log(f"{self._rerun_log_path}/resultant/fy", rr.Scalars(res_n[1]))
+                rr.log(f"{self._rerun_log_path}/resultant/fz", rr.Scalars(res_n[2]))
+        except Exception:
+            pass
 
     # ---- data extraction ---------------------------------------------------
 
