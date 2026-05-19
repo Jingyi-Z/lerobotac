@@ -23,6 +23,76 @@ from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
 
 
+_SO101_JOINTS = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
+
+
+def _default_so101_blueprint():
+    """Build the default Cowork/SO-101 layout used by ``init_rerun``.
+
+    Three rows x two columns:
+      (1) Paxini force time series  |  Paxini 3D point cloud
+      (2) Wrist camera              |  Top camera
+      (3) Joint positions (all 12)  |  Hall sensor (MLX) scalars
+
+    Missing entities render as empty panels - safe to leave in even when
+    the user runs without one of the sensors.
+    """
+    import rerun.blueprint as rrb
+
+    paxini_root = "/observation.sensors.paxini_fingertip"
+
+    paxini_forces = rrb.TimeSeriesView(
+        name="Paxini forces (N)",
+        contents=[
+            f"{paxini_root}/sum_fx",
+            f"{paxini_root}/sum_fy",
+            f"{paxini_root}/sum_fz",
+            f"{paxini_root}/resultant/**",
+        ],
+    )
+    paxini_3d = rrb.Spatial3DView(
+        name="Paxini fingertip",
+        origin=paxini_root,
+        contents=[f"{paxini_root}/anatomy", f"{paxini_root}/distributed"],
+    )
+
+    wrist_cam = rrb.Spatial2DView(name="Wrist", origin="/observation.wrist")
+    top_cam = rrb.Spatial2DView(name="Top", origin="/observation.top")
+
+    joint_contents = [f"/action.{j}.pos" for j in _SO101_JOINTS] + [
+        f"/observation.{j}.pos" for j in _SO101_JOINTS
+    ]
+    joints = rrb.TimeSeriesView(name="Joint positions", contents=joint_contents)
+
+    # MLX gripper sensor data; the visualization_utils 2D branch logs each
+    # of the 3 axes as `..._0/_1/_2`. The sensor's dict key is configurable;
+    # `gripper` is the user's current convention.
+    hall = rrb.TimeSeriesView(
+        name="Hall sensor (gripper)",
+        contents=[
+            "/observation.sensors.gripper_0",
+            "/observation.sensors.gripper_1",
+            "/observation.sensors.gripper_2",
+        ],
+    )
+
+    return rrb.Blueprint(
+        rrb.Vertical(
+            rrb.Horizontal(paxini_forces, paxini_3d),
+            rrb.Horizontal(wrist_cam, top_cam),
+            rrb.Horizontal(joints, hall),
+        ),
+        collapse_panels=True,
+    )
+
+
 def init_rerun(
     session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
 ) -> None:
@@ -46,6 +116,17 @@ def init_rerun(
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
     else:
         rr.spawn(memory_limit=memory_limit)
+
+    # Push a default blueprint matching the SO-101 + Paxini fingertip
+    # workflow. Set LEROBOT_DEFAULT_BLUEPRINT=0 to skip and fall back to
+    # rerun's auto-Blueprint.
+    bp_env = os.getenv("LEROBOT_DEFAULT_BLUEPRINT", "1")
+    if bp_env not in ("0", "false", "False"):
+        try:
+            rr.send_blueprint(_default_so101_blueprint(), make_active=True, make_default=True)
+        except Exception as e:
+            import logging
+            logging.warning(f"Skipping default lerobot blueprint: {e}")
 
 
 def shutdown_rerun() -> None:
@@ -122,7 +203,7 @@ def log_rerun_data(
                     # Tactile sensor ring buffer of shape (N, P, 3).
                     # N is the buffer_size (small, <= 16); P is the taxel
                     # count. Camera frames are also (H, W, 3) and ndim==3,
-                    # so the size guards are essential — otherwise this
+                    # so the size guards are essential - otherwise this
                     # branch hijacks every camera log. P caps at ~100 across
                     # all Paxini variants in the registry; 256 is generous.
                     # We only log per-axis sums here; the spatial layout is
@@ -130,7 +211,7 @@ def log_rerun_data(
                     # PaxiniSensor._log_to_rerun emits under
                     # `observation.sensors.{name}/distributed` when
                     # `display_rerun: true`.
-                    latest = arr[-1]                          # (P, 3)
+                    latest = arr[-1]
                     rr.log(f"{key}/sum_fx", rr.Scalars(float(latest[:, 0].sum())))
                     rr.log(f"{key}/sum_fy", rr.Scalars(float(latest[:, 1].sum())))
                     rr.log(f"{key}/sum_fz", rr.Scalars(float(latest[:, 2].sum())))
