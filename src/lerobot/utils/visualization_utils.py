@@ -113,16 +113,24 @@ def log_rerun_data(
                     latest = arr[-1]
                     for i, vi in enumerate(latest):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
-                elif arr.ndim == 3 and arr.shape[-1] == 3:
-                    # Tactile grid of shape (N, P, 3): log most-recent frame's
-                    # Fz channel as an animated heatmap, plus the per-axis
-                    # sum across taxels as scalars.
+                elif (
+                    arr.ndim == 3
+                    and arr.shape[-1] == 3
+                    and arr.shape[0] <= 16
+                    and arr.shape[1] <= 256
+                ):
+                    # Tactile sensor ring buffer of shape (N, P, 3).
+                    # N is the buffer_size (small, <= 16); P is the taxel
+                    # count. Camera frames are also (H, W, 3) and ndim==3,
+                    # so the size guards are essential — otherwise this
+                    # branch hijacks every camera log. P caps at ~100 across
+                    # all Paxini variants in the registry; 256 is generous.
+                    # We only log per-axis sums here; the spatial layout is
+                    # better served by the 3D point cloud that
+                    # PaxiniSensor._log_to_rerun emits under
+                    # `observation.sensors.{name}/distributed` when
+                    # `display_rerun: true`.
                     latest = arr[-1]                          # (P, 3)
-                    fz_col = latest[:, 2:3].reshape(-1, 1)    # (P, 1)
-                    if compress_images:
-                        rr.log(f"{key}/fz", rr.Image(fz_col).compress())
-                    else:
-                        rr.log(f"{key}/fz", rr.Image(fz_col))
                     rr.log(f"{key}/sum_fx", rr.Scalars(float(latest[:, 0].sum())))
                     rr.log(f"{key}/sum_fy", rr.Scalars(float(latest[:, 1].sum())))
                     rr.log(f"{key}/sum_fz", rr.Scalars(float(latest[:, 2].sum())))
