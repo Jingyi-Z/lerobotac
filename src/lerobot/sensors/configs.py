@@ -50,3 +50,44 @@ class MLX90393SensorConfig(SensorConfig):
 
     # Optional fixed baseline [Bx, By, Bz]. If provided, skips auto-calibration.
     baseline: list[float] | None = None
+
+@SensorConfig.register_subclass("paxini")
+@dataclass
+class PaxiniSensorConfig(SensorConfig):
+    """Paxini PX-6AX GEN3 tactile sensor via paxini-sdk.
+
+    Wraps :class:`paxini_sdk.HighSpeedHandBoard` so a Paxini fingertip,
+    finger-pad, or palm sensor fits into the lerobot sensor framework. See
+    the paxini-sdk docs for full protocol details:
+    https://github.com/Jingyi-Z/paxini-sdk
+    """
+
+    # Serial port the High-Speed Communication Board appears as.
+    # Windows: "COM7". macOS: "/dev/cu.usbserial-XXXX". Linux: "/dev/ttyUSB0".
+    port: str = "/dev/cu.usbserial-0001"
+
+    # Default 921600 — the board's fixed UART baud rate.
+    baud_rate: int = 921_600
+
+    # Number of recent frames kept in the ring buffer (the N in (N, ...)).
+    buffer_size: int = 10
+
+    # Which module slot to read from. None = first active slot reported by
+    # the board (correct when only one sensor is plugged in).
+    module_index: int | None = None
+
+    # Output tensor shape:
+    #   "resultant"   -> (N, 3)         resultant Fx Fy Fz per frame
+    #   "distributed" -> (N, P, 3)      per-taxel Fx Fy Fz grid (P from board)
+    #   "both"        -> (N, 3 + P*3)   flat concat: resultant + distributed
+    output_format: str = "resultant"
+
+    # If True, send the vendor's firmware calibration frame on connect
+    # (zeros the Hall-field baseline inside the sensor MCU).
+    auto_calibrate: bool = True
+
+    # Optional host-side baseline subtraction stacked on top of firmware
+    # calibration. 0 disables. If > 0, average that many frames after
+    # connect and subtract from subsequent samples — useful for trimming
+    # residual ~1 LSB offset for sub-LSB precision work.
+    software_baseline_frames: int = 0
