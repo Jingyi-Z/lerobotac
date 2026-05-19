@@ -24,9 +24,12 @@ def make_sensors_from_configs(sensor_configs: dict[str, SensorConfig]) -> dict[s
         if cfg.type == "mlx90393":
             from .mlx90393 import MLX90393Sensor
             sensors[key] = MLX90393Sensor(cfg)
+        elif cfg.type == "paxini":
+            from .paxini import PaxiniSensor
+            sensors[key] = PaxiniSensor(cfg)
         else:
             raise ValueError(
                 f"Unknown sensor type {cfg.type!r} for sensor {key!r}. "
-                f"Available types: ['mlx90393']"
+                f"Available types: ['mlx90393', 'paxini']"
             )
     return sensors
