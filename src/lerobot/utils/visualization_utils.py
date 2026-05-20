@@ -39,7 +39,7 @@ def _default_so101_blueprint():
     Three rows x two columns:
       (1) Paxini force time series  |  Paxini 3D point cloud
       (2) Wrist camera              |  Top camera
-      (3) Joint positions (all 12)  |  Hall sensor (MLX) scalars
+      (3) Joint positions (all 12)  |  Hall sensor (MLX) 10x3 buffer
 
     Missing entities render as empty panels - safe to leave in even when
     the user runs without one of the sensors.
@@ -71,16 +71,12 @@ def _default_so101_blueprint():
     ]
     joints = rrb.TimeSeriesView(name="Joint positions", contents=joint_contents)
 
-    # MLX gripper sensor data; the visualization_utils 2D branch logs each
-    # of the 3 axes as `..._0/_1/_2`. The sensor's dict key is configurable;
-    # `gripper` is the user's current convention.
-    hall = rrb.TimeSeriesView(
-        name="Hall sensor (gripper)",
-        contents=[
-            "/observation.sensors.gripper_0",
-            "/observation.sensors.gripper_1",
-            "/observation.sensors.gripper_2",
-        ],
+    # MLX gripper buffer as a (10, 3) heatmap; updated per tick by the
+    # ndim==2 branch of `log_rerun_data` below.
+    hall = rrb.Spatial2DView(
+        name="Hall sensor (10x3)",
+        origin="/observation.sensors.gripper/array",
+        contents=["/observation.sensors.gripper/array"],
     )
 
     return rrb.Blueprint(
@@ -188,9 +184,14 @@ def log_rerun_data(
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 elif arr.ndim == 2 and arr.shape[-1] <= 16:
-                    # Sensor ring buffer of shape (N, D): log most-recent
-                    # frame's D channels as animated scalars instead of a
-                    # static image. Works for MLX (N, 3) and Paxini resultant.
+                    # Sensor ring buffer of shape (N, D). Log TWO things:
+                    #   - `{key}/array`: the full (N, D) buffer as a small
+                    #     heatmap image. Renders as e.g. a 10x3 strip for
+                    #     MLX, giving the user the full ring-buffer state
+                    #     at every tick instead of only the latest sample.
+                    #   - `{key}_0`, `{key}_1`, ...: the latest sample's
+                    #     D channels as scalars, for time-series plotting.
+                    rr.log(f"{key}/array", rr.Image(arr.astype(np.float32)))
                     latest = arr[-1]
                     for i, vi in enumerate(latest):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
