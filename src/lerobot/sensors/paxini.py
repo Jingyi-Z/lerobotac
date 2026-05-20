@@ -10,61 +10,86 @@
 
 """Paxini PX-6AX GEN3 tactile sensor adapter for the lerobot sensor framework.
 
-Wraps :class:`paxini_sdk.HighSpeedHandBoard` so a Paxini fingertip / finger-pad
-can be used wherever a :class:`lerobot.sensors.Sensor` is expected.
+Wraps the paxini-sdk board drivers so a Paxini fingertip / finger-pad can be
+used wherever a :class:`lerobot.sensors.Sensor` is expected.
 
-Two output modes (selected via the config's ``output_format`` field):
+Two communication boards are supported, selected via the config's
+``board_type`` field:
 
-* ``"resultant"`` — ``(N, 3)`` float32, the resultant Fx, Fy, Fz on the
-  active module. Newtons.
-* ``"distributed"`` — ``(N, P, 3)`` float32, the per-taxel Fx, Fy, Fz grid.
-  P is the active sensor's point count (52 for DP-S2015-Elite).
-* ``"both"`` — flattens to ``(N, 3 + P*3)`` so a single sensor entry covers
-  the entire force tensor for downstream collection.
+* ``"high_speed"`` -- High-Speed Communication Board. Auto-push streaming at
+  ~91 Hz; reports its sensor's point count from a register.
+* ``"serial"``     -- Serial Converter Board. Request/response only (~8-16 Hz,
+  no auto-push); cannot report the sensor model, so ``sensor_part_code`` must
+  be supplied in the config.
 
-The Paxini sensor does its own baseline subtraction in firmware (the
-``calibrate()`` call documented in the protocol PDF §1.3.1 and Hand_UI.py
-line 274); ``auto_calibrate=True`` runs that at connect time. An optional
-host-side baseline can be layered on top via ``software_baseline_frames``.
+Three output modes (config ``output_format``):
+
+* ``"resultant"``   -- ``(N, 3)`` float32, resultant Fx, Fy, Fz. Newtons.
+* ``"distributed"`` -- ``(N, P, 3)`` float32, per-taxel Fx, Fy, Fz grid.
+  P is the sensor's point count.
+* ``"both"``        -- ``(N, 3 + P*3)`` flat concat of resultant + distributed.
+
+Both boards do firmware baseline subtraction via a ``calibrate()`` call;
+``auto_calibrate=True`` runs it at connect time. An optional host-side
+baseline can be layered on top via ``software_baseline_frames``.
 """
 
 import logging
 import threading
 import time
 from collections import deque
-from typing import Deque, Optional
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 
 from .configs import PaxiniSensorConfig
 from .sensor import Sensor
 
+# Newtons per LSB for the Serial Converter Board's raw force counts
+# (vendor USB_UI.py parse_resultant_force / parse_distributed_force).
+_SERIAL_LSB_N = 0.1
+
+# A resultant reading in newtons, or None if unavailable this cycle.
+_ResN = Optional[Tuple[float, float, float]]
+# A distributed reading: list of per-taxel (Fx, Fy, Fz) newton tuples.
+_DistN = Optional[List[Tuple[float, float, float]]]
+
 
 class PaxiniSensor(Sensor):
-    """Driver for a Paxini PX-6AX GEN3 tactile sensor via paxini-sdk."""
+    """Driver for a Paxini PX-6AX GEN3 tactile sensor via paxini-sdk.
+
+    Supports both the High-Speed Communication Board and the single-channel
+    Serial Converter Board (``config.board_type``).
+    """
 
     def __init__(self, config: PaxiniSensorConfig):
         super().__init__(config)
         self.config: PaxiniSensorConfig = config
 
-        # Lazy import so paxini-sdk is only required if this class is instantiated.
+        # Lazy import so paxini-sdk is only required if this class is used.
         try:
-            from paxini_sdk import HighSpeedHandBoard  # noqa: F401
-            from paxini_sdk import registers  # noqa: F401
+            import paxini_sdk  # noqa: F401
         except ImportError as e:
             raise ImportError(
                 "paxini-sdk is not installed. Install it with: pip install paxini-sdk"
             ) from e
 
-        self._hand = None
+        self._board_type = getattr(config, "board_type", "high_speed")
+        if self._board_type not in ("high_speed", "serial"):
+            raise ValueError(
+                f"Unsupported board_type: {self._board_type!r} "
+                "(expected 'high_speed' or 'serial')"
+            )
+
+        self._board = None              # HighSpeedHandBoard or SingleSensorBoard
         self._is_connected = False
-        self._stream_iter = None
         self._stop_event = threading.Event()
         self._data_thread: threading.Thread | None = None
         self._data_lock = threading.Lock()
         self._ring: Deque[np.ndarray] = deque(maxlen=config.buffer_size)
-        self._sample_dim: int | None = None      # set once we know the shape
-        self._active_module_idx: int | None = None
+        self._sample_dim = None         # int, or (P, 3) tuple for distributed
+        self._active_module_idx: int | None = None   # high-speed only
+        self._module_name: str | None = None         # high-speed module / serial label
         self._n_taxels: int | None = None
 
         # Optional software baseline (atop the firmware calibration)
@@ -98,11 +123,9 @@ class PaxiniSensor(Sensor):
     @property
     def shape(self) -> tuple[int, ...]:
         if self._sample_dim is None:
-            # Best-effort: assume resultant if we haven't connected yet.
-            # The actual shape is finalized in connect().
+            # Best-effort before connect(); finalized in connect().
             return (self.config.buffer_size, 3)
         if isinstance(self._sample_dim, tuple):
-            # Distributed mode: _sample_dim is (P, 3)
             return (self.config.buffer_size, *self._sample_dim)
         return (self.config.buffer_size, self._sample_dim)
 
@@ -112,38 +135,30 @@ class PaxiniSensor(Sensor):
             return self._is_connected
         return self._sw_baseline is not None
 
+    # ---- whether the read loop needs each data type ------------------------
+
+    @property
+    def _needs_resultant(self) -> bool:
+        return self.config.output_format in ("resultant", "both")
+
+    @property
+    def _needs_distributed(self) -> bool:
+        # display_rerun needs the per-taxel grid for the 3D point cloud even
+        # if the recorded output is resultant-only.
+        return (
+            self.config.output_format in ("distributed", "both")
+            or self.config.display_rerun
+        )
+
     # ---- lifecycle ---------------------------------------------------------
 
     def connect(self) -> None:
-        from paxini_sdk import HighSpeedHandBoard, registers
-
-        self._hand = HighSpeedHandBoard(
-            self.config.port, baudrate=self.config.baud_rate
-        )
-        self._hand.open()
-        active = self._hand.read_active_modules()
-        if not active:
-            self._hand.close()
-            self._hand = None
-            raise RuntimeError(
-                "No active Paxini modules detected. Check the FPC cable orientation."
-            )
-
-        if self.config.module_index is None:
-            self._active_module_idx = active[0]
+        if self._board_type == "serial":
+            self._connect_serial()
         else:
-            if self.config.module_index not in active:
-                self._hand.close()
-                self._hand = None
-                raise RuntimeError(
-                    f"Requested module {self.config.module_index} "
-                    f"({registers.MODULE_NAMES[self.config.module_index]}) "
-                    f"not active; active list is {active}."
-                )
-            self._active_module_idx = self.config.module_index
+            self._connect_high_speed()
 
-        # Discover sample dimensionality from the active module's point count
-        self._n_taxels = self._hand.read_distribution_point_count(self._active_module_idx)
+        # Resolve the recorded-sample dimensionality from the point count.
         if self.config.output_format == "resultant":
             self._sample_dim = 3
         elif self.config.output_format == "distributed":
@@ -155,54 +170,116 @@ class PaxiniSensor(Sensor):
                 f"Unsupported output_format: {self.config.output_format!r}"
             )
 
-        if self.config.auto_calibrate:
-            logging.info("Paxini: triggering firmware calibration ...")
-            self._hand.calibrate()
-
         self._is_connected = True
-        module_name = registers.MODULE_NAMES[self._active_module_idx]
         logging.info(
             f"Connected to Paxini sensor on {self.config.port} "
-            f"(module={module_name}, taxels={self._n_taxels}, "
-            f"output={self.config.output_format})"
+            f"(board={self._board_type}, label={self._module_name}, "
+            f"taxels={self._n_taxels}, output={self.config.output_format})"
+        )
+        self._preload_rerun_coords()
+
+    def _connect_high_speed(self) -> None:
+        from paxini_sdk import HighSpeedHandBoard, registers
+
+        self._board = HighSpeedHandBoard(
+            self.config.port, baudrate=self.config.baud_rate
+        )
+        self._board.open()
+        active = self._board.read_active_modules()
+        if not active:
+            self._board.close()
+            self._board = None
+            raise RuntimeError(
+                "No active Paxini modules detected. Check the FPC cable orientation."
+            )
+
+        if self.config.module_index is None:
+            self._active_module_idx = active[0]
+        else:
+            if self.config.module_index not in active:
+                self._board.close()
+                self._board = None
+                raise RuntimeError(
+                    f"Requested module {self.config.module_index} "
+                    f"({registers.MODULE_NAMES[self.config.module_index]}) "
+                    f"not active; active list is {active}."
+                )
+            self._active_module_idx = self.config.module_index
+
+        self._module_name = registers.MODULE_NAMES[self._active_module_idx]
+        self._n_taxels = self._board.read_distribution_point_count(
+            self._active_module_idx
         )
 
-        # Pre-load anatomy coords if rerun display is enabled
-        if self.config.display_rerun:
-            try:
-                from paxini_sdk import sensor_registry
-                variant = sensor_registry.find_by_point_count(self._n_taxels)
-                if variant is not None:
-                    self._rerun_coords = sensor_registry.load_points(variant)
-                    # Log under the lerobot Blueprint's auto-built namespace
-                    # for this sensor so the 3D point cloud joins the existing
-                    # `observation.sensors.{sensor_name}` panel. Fall back to
-                    # the legacy `sensor/{module_name}` path only if the
-                    # factory didn't set a name on us (e.g. direct
-                    # instantiation in scripts).
-                    if self._sensor_name:
-                        self._rerun_log_path = (
-                            f"observation.sensors.{self._sensor_name}"
-                        )
-                    else:
-                        safe_name = module_name.lower().replace("-", "_")
-                        self._rerun_log_path = f"sensor/{safe_name}"
-                    logging.info(
-                        f"Paxini: rerun 3D point cloud enabled for "
-                        f"{variant.vendor_part_code} at '{self._rerun_log_path}'"
-                    )
-            except Exception as e:
-                logging.warning(f"Paxini: rerun coords unavailable ({e}); "
-                                "the display_rerun flag is a no-op.")
+        if self.config.auto_calibrate:
+            logging.info("Paxini: triggering firmware calibration ...")
+            self._board.calibrate()
+
+    def _connect_serial(self) -> None:
+        from paxini_sdk import SingleSensorBoard, sensor_registry
+
+        part_code = getattr(self.config, "sensor_part_code", None)
+        if not part_code:
+            raise RuntimeError(
+                "board_type='serial' requires sensor_part_code in the config "
+                "(e.g. 'PXSR-STDDP03A'). The Serial Converter Board cannot "
+                "report which sensor is attached."
+            )
+        variant = sensor_registry.find_by_part_code(part_code)
+        if variant is None:
+            known = [s.vendor_part_code for s in sensor_registry.list_sensors()]
+            raise RuntimeError(
+                f"Unknown sensor_part_code {part_code!r}. Known codes: {known}"
+            )
+        self._n_taxels = variant.n_points
+        self._module_name = variant.vendor_part_code
+
+        self._board = SingleSensorBoard(
+            self.config.port,
+            baudrate=self.config.baud_rate,
+            device_id=getattr(self.config, "device_id", 0x01),
+            sensor=variant,
+        )
+        self._board.open()
+
+        if self.config.auto_calibrate:
+            logging.info("Paxini: triggering Serial Converter Board calibration ...")
+            self._board.calibrate()  # synchronous request/response
+
+    def _preload_rerun_coords(self) -> None:
+        """Load the sensor's anatomy coordinates for the optional 3D rerun
+        point cloud. No-op if display_rerun is off or coords are unavailable."""
+        if not self.config.display_rerun:
+            return
+        try:
+            from paxini_sdk import sensor_registry
+            variant = sensor_registry.find_by_point_count(self._n_taxels)
+            if variant is None:
+                logging.warning("Paxini: no registry match for "
+                                f"{self._n_taxels} points; display_rerun is a no-op.")
+                return
+            self._rerun_coords = sensor_registry.load_points(variant)
+            if self._sensor_name:
+                self._rerun_log_path = f"observation.sensors.{self._sensor_name}"
+            else:
+                safe = (self._module_name or "paxini").lower().replace("-", "_")
+                self._rerun_log_path = f"sensor/{safe}"
+            logging.info(
+                f"Paxini: rerun 3D point cloud enabled for "
+                f"{variant.vendor_part_code} at '{self._rerun_log_path}'"
+            )
+        except Exception as e:
+            logging.warning(f"Paxini: rerun coords unavailable ({e}); "
+                            "the display_rerun flag is a no-op.")
 
     def disconnect(self) -> None:
         self.stop_continuous_read()
-        if self._hand is not None:
+        if self._board is not None:
             try:
-                self._hand.close()
+                self._board.close()
             except Exception:
                 pass
-        self._hand = None
+        self._board = None
         self._is_connected = False
         logging.info("Disconnected from Paxini sensor")
 
@@ -227,41 +304,158 @@ class PaxiniSensor(Sensor):
         self._data_thread = None
 
     def _continuous_read_loop(self) -> None:
-        from paxini_sdk import registers
-        module_name = registers.MODULE_NAMES[self._active_module_idx]
         try:
-            for frame in self._hand.stream_auto_push(per_frame_timeout=0.2):
-                if self._stop_event.is_set():
-                    break
-                sample = self._frame_to_sample(frame, module_name)
-                if sample is None:
-                    continue
-                # Optional software baseline calibration
-                if self.config.software_baseline_frames > 0 and self._sw_baseline is None:
-                    self._sw_baseline_buf.append(sample.copy())
-                    if len(self._sw_baseline_buf) >= self.config.software_baseline_frames:
-                        self._sw_baseline = np.mean(
-                            np.stack(self._sw_baseline_buf), axis=0
-                        ).astype(np.float32)
-                        self._sw_baseline_buf.clear()
-                        logging.info(
-                            "Paxini: software baseline captured "
-                            f"({self.config.software_baseline_frames} frames)"
-                        )
-                    continue
-                if self._sw_baseline is not None:
-                    sample = sample - self._sw_baseline
-                with self._data_lock:
-                    self._ring.append(sample)
-                if self.config.display_rerun:
-                    self._log_to_rerun(frame, module_name)
+            if self._board_type == "serial":
+                self._serial_read_loop()
+            else:
+                self._high_speed_read_loop()
         except Exception as e:
             logging.exception(f"Paxini read loop terminated: {e}")
 
-    def _log_to_rerun(self, frame, module_name: str) -> None:
-        """Push a 3D point cloud of the 52 tactile points to rerun, plus
-        per-axis sum-of-forces scalars. Safe no-op if rerun isn't running
-        or the anatomy coordinates weren't loaded."""
+    def _high_speed_read_loop(self) -> None:
+        """Consume the High-Speed board's auto-push stream (~91 Hz).
+
+        If config.poll_rate_hz > 0 the stream is downsampled to that rate:
+        every frame is still pulled off the wire (so the serial buffer stays
+        drained), but only one frame per 1/rate period is recorded. This
+        gives the same fixed, deterministic cadence as the serial board's
+        rate lock. poll_rate_hz = 0 records every frame at the native rate."""
+        module_name = self._module_name
+        rate = max(0.0, float(getattr(self.config, "poll_rate_hz", 0.0)))
+        period = (1.0 / rate) if rate > 0 else 0.0
+        last_ingest = 0.0
+        for frame in self._board.stream_auto_push(per_frame_timeout=0.2):
+            if self._stop_event.is_set():
+                break
+            if period:
+                now = time.monotonic()
+                if now - last_ingest < period:
+                    continue  # drop this frame; keeps the ring at target rate
+                last_ingest = now
+            res_n = frame.resultant_forces_newtons.get(module_name)
+            dist_n = frame.distributed_forces_newtons.get(module_name) or None
+            self._ingest(res_n, dist_n)
+
+    def _serial_read_loop(self) -> None:
+        """Poll the Serial Converter Board (request/response).
+
+        The board has no auto-push. With the length-based read in
+        paxini_sdk.transport.fin_transaction each round-trip is fast, so the
+        loop can run well above the old ~8-16 Hz. If config.poll_rate_hz > 0
+        the loop is locked to that rate by sleeping the remainder of each
+        1/rate period -- a stable, deterministic cadence like the Teensy
+        gives the MLX hall sensor. poll_rate_hz = 0 polls as fast as the
+        board answers. Failed transactions are logged once and retried."""
+        rate = max(0.0, float(getattr(self.config, "poll_rate_hz", 0.0)))
+        period = (1.0 / rate) if rate > 0 else 0.0
+        warned = False
+        rate_warned = False
+        while not self._stop_event.is_set():
+            cycle_start = time.monotonic()
+            try:
+                res_n: _ResN = None
+                dist_n: _DistN = None
+                if self._needs_resultant:
+                    fx, fy, fz = self._board.read_resultant_force()
+                    res_n = (fx * _SERIAL_LSB_N, fy * _SERIAL_LSB_N,
+                             fz * _SERIAL_LSB_N)
+                if self._needs_distributed:
+                    pts = self._board.read_distributed_force()
+                    dist_n = [
+                        (p.fx * _SERIAL_LSB_N, p.fy * _SERIAL_LSB_N,
+                         p.fz * _SERIAL_LSB_N)
+                        for p in pts
+                    ]
+                self._ingest(res_n, dist_n)
+            except Exception as e:
+                if not warned:
+                    logging.warning(f"Paxini serial read error (retrying): {e}")
+                    warned = True
+                self._stop_event.wait(0.1)
+                continue
+            # Rate lock: sleep whatever is left of this period. Uses the stop
+            # event so a disconnect interrupts the wait promptly.
+            if period:
+                remaining = period - (time.monotonic() - cycle_start)
+                if remaining > 0:
+                    self._stop_event.wait(remaining)
+                elif not rate_warned:
+                    logging.warning(
+                        f"Paxini: serial board can't sustain poll_rate_hz="
+                        f"{rate:.0f} (a read cycle took longer than "
+                        f"{period * 1000:.0f} ms); running as fast as possible."
+                    )
+                    rate_warned = True
+
+    # ---- shared sample ingestion ------------------------------------------
+
+    def _ingest(self, res_n: _ResN, dist_n: _DistN) -> None:
+        """Turn one (resultant, distributed) reading into a recorded sample:
+        build the tensor, apply the optional software baseline, append to the
+        ring buffer, and (optionally) log the 3D point cloud to rerun."""
+        sample = self._build_sample(res_n, dist_n)
+        if sample is None:
+            return
+
+        # Optional host-side baseline calibration (atop firmware calibration)
+        if self.config.software_baseline_frames > 0 and self._sw_baseline is None:
+            self._sw_baseline_buf.append(sample.copy())
+            if len(self._sw_baseline_buf) >= self.config.software_baseline_frames:
+                self._sw_baseline = np.mean(
+                    np.stack(self._sw_baseline_buf), axis=0
+                ).astype(np.float32)
+                self._sw_baseline_buf.clear()
+                logging.info(
+                    "Paxini: software baseline captured "
+                    f"({self.config.software_baseline_frames} frames)"
+                )
+            return
+        if self._sw_baseline is not None:
+            sample = sample - self._sw_baseline
+
+        with self._data_lock:
+            self._ring.append(sample)
+
+        if self.config.display_rerun:
+            self._log_to_rerun(res_n, dist_n)
+
+    def _build_sample(self, res_n: _ResN, dist_n: _DistN) -> np.ndarray | None:
+        """Build a float32 sample of shape (3,), (P, 3), or (3 + P*3,)
+        depending on output_format, from a (resultant, distributed) reading."""
+        fmt = self.config.output_format
+        if fmt == "resultant":
+            if res_n is None:
+                return None
+            return np.array(res_n, dtype=np.float32)
+
+        if fmt == "distributed":
+            if not dist_n:
+                return None
+            arr = np.array(dist_n, dtype=np.float32)
+            return self._pad_taxels(arr)
+
+        if fmt == "both":
+            if res_n is None and not dist_n:
+                return None
+            res_arr = np.array(res_n or (0.0, 0.0, 0.0), dtype=np.float32)
+            pts_arr = np.array(
+                dist_n or [(0.0, 0.0, 0.0)] * self._n_taxels, dtype=np.float32
+            )
+            pts_arr = self._pad_taxels(pts_arr)
+            return np.concatenate([res_arr, pts_arr.flatten()], axis=0)
+        return None
+
+    def _pad_taxels(self, arr: np.ndarray) -> np.ndarray:
+        """Pad/trim a (P', 3) array to exactly (n_taxels, 3)."""
+        if arr.shape[0] < self._n_taxels:
+            pad = np.zeros((self._n_taxels - arr.shape[0], 3), dtype=np.float32)
+            return np.concatenate([arr, pad], axis=0)
+        return arr[: self._n_taxels]
+
+    def _log_to_rerun(self, res_n: _ResN, dist_n: _DistN) -> None:
+        """Push a 3D point cloud of the tactile points to rerun, plus per-axis
+        resultant scalars. Safe no-op if rerun isn't running or the anatomy
+        coordinates weren't loaded."""
         if self._rerun_coords is None or self._rerun_log_path is None:
             return
         try:
@@ -269,13 +463,8 @@ class PaxiniSensor(Sensor):
         except ImportError:
             return
         try:
-            pts_n = frame.distributed_forces_newtons.get(module_name)
-            if not pts_n:
-                return
             if not self._rerun_anatomy_logged:
-                # Faint backdrop so the user always sees the fingertip shape
-                # even when nothing is touching. Tiny radii so the dynamic
-                # `distributed` dots dominate visually when contact happens.
+                # Faint backdrop so the fingertip shape is always visible.
                 pale = [(180, 185, 195)] * len(self._rerun_coords)
                 rr.log(
                     f"{self._rerun_log_path}/anatomy",
@@ -285,32 +474,27 @@ class PaxiniSensor(Sensor):
                 )
                 self._rerun_anatomy_logged = True
 
-            # High-contrast hue shift (blue → red) keyed to abs(Fz). The
-            # vendor's 0.1 N/LSB resolution means light contact is roughly
-            # 0.2-0.4 N; we saturate at 0.5 N so a fingertip press already
-            # paints the cloud red. Radii blow up to 3.0 at saturation so
-            # contact area is unmistakable.
-            n = min(len(pts_n), len(self._rerun_coords))
-            colors = []
-            radii = []
-            SAT_N = 0.5  # Fz at which color/radius is fully saturated
-            for i in range(n):
-                fz = abs(pts_n[i][2])
-                t = max(0.0, min(1.0, fz / SAT_N))
-                # Cold (rest)   = (40, 110, 220)   blue
-                # Hot  (contact)= (230, 40, 40)    red
-                r = round(40 + (230 - 40) * t)
-                g = round(110 + (40 - 110) * t)
-                b = round(220 + (40 - 220) * t)
-                colors.append((r, g, b))
-                radii.append(0.3 + 2.7 * t)
-            rr.log(
-                f"{self._rerun_log_path}/distributed",
-                rr.Points3D(positions=self._rerun_coords[:n],
-                             colors=colors, radii=radii),
-            )
+            if dist_n:
+                # High-contrast blue->red hue keyed to abs(Fz), saturating at
+                # 0.5 N so a light fingertip press already paints red. Radii
+                # blow up to 3.0 at saturation so contact area is obvious.
+                n = min(len(dist_n), len(self._rerun_coords))
+                colors, radii = [], []
+                SAT_N = 0.5
+                for i in range(n):
+                    fz = abs(dist_n[i][2])
+                    t = max(0.0, min(1.0, fz / SAT_N))
+                    r = round(40 + (230 - 40) * t)
+                    g = round(110 + (40 - 110) * t)
+                    b = round(220 + (40 - 220) * t)
+                    colors.append((r, g, b))
+                    radii.append(0.3 + 2.7 * t)
+                rr.log(
+                    f"{self._rerun_log_path}/distributed",
+                    rr.Points3D(positions=self._rerun_coords[:n],
+                                 colors=colors, radii=radii),
+                )
 
-            res_n = frame.resultant_forces_newtons.get(module_name)
             if res_n is not None:
                 rr.log(f"{self._rerun_log_path}/resultant/fx", rr.Scalars(res_n[0]))
                 rr.log(f"{self._rerun_log_path}/resultant/fy", rr.Scalars(res_n[1]))
@@ -318,38 +502,7 @@ class PaxiniSensor(Sensor):
         except Exception:
             pass
 
-    # ---- data extraction ---------------------------------------------------
-
-    def _frame_to_sample(self, frame, module_name: str) -> np.ndarray | None:
-        """Convert one AutoPushFrame into a flat float32 sample of shape
-        (sample_dim,) or (P, 3) depending on output_format."""
-        if self.config.output_format == "resultant":
-            forces = frame.resultant_forces_newtons.get(module_name)
-            if forces is None:
-                return None
-            return np.array(forces, dtype=np.float32)
-        elif self.config.output_format == "distributed":
-            pts = frame.distributed_forces_newtons.get(module_name, [])
-            if not pts:
-                return None
-            arr = np.array(pts, dtype=np.float32)
-            if arr.shape[0] < self._n_taxels:
-                pad = np.zeros((self._n_taxels - arr.shape[0], 3), dtype=np.float32)
-                arr = np.concatenate([arr, pad], axis=0)
-            return arr  # shape (P, 3)
-        elif self.config.output_format == "both":
-            res = frame.resultant_forces_newtons.get(module_name)
-            pts = frame.distributed_forces_newtons.get(module_name, [])
-            if res is None and not pts:
-                return None
-            res_arr = np.array(res or (0.0, 0.0, 0.0), dtype=np.float32)
-            pts_arr = np.array(pts or [(0.0, 0.0, 0.0)] * self._n_taxels,
-                                dtype=np.float32)
-            if pts_arr.shape[0] < self._n_taxels:
-                pad = np.zeros((self._n_taxels - pts_arr.shape[0], 3), dtype=np.float32)
-                pts_arr = np.concatenate([pts_arr, pad], axis=0)
-            return np.concatenate([res_arr, pts_arr.flatten()], axis=0)
-        return None
+    # ---- data access -------------------------------------------------------
 
     def get_latest_data(self) -> np.ndarray | None:
         if not self._is_connected:
@@ -362,7 +515,7 @@ class PaxiniSensor(Sensor):
             return np.zeros(self.shape, dtype=np.float32)
 
         if self.config.output_format == "distributed":
-            # Each sample is (P, 3); stack along axis 0 -> (N, P, 3)
+            # Each sample is (P, 3); stack -> (N, P, 3)
             if len(samples) < self.config.buffer_size:
                 pad = np.zeros(
                     (self.config.buffer_size - len(samples), self._n_taxels, 3),
@@ -372,10 +525,9 @@ class PaxiniSensor(Sensor):
             return np.stack(samples)
 
         # Resultant / both: each sample is (D,)
-        sample_dim = self._sample_dim
         if len(samples) < self.config.buffer_size:
             pad = np.zeros(
-                (self.config.buffer_size - len(samples), sample_dim),
+                (self.config.buffer_size - len(samples), self._sample_dim),
                 dtype=np.float32,
             )
             return np.concatenate([pad, np.stack(samples)], axis=0)
@@ -390,17 +542,16 @@ class PaxiniSensor(Sensor):
         return True
 
     def metadata(self) -> dict:
-        from paxini_sdk import registers
         return {
             **super().metadata(),
+            "board_type": self._board_type,
             "port": self.config.port,
             "baud_rate": self.config.baud_rate,
             "buffer_size": self.config.buffer_size,
             "module_index": self._active_module_idx,
-            "module_name": (
-                registers.MODULE_NAMES[self._active_module_idx]
-                if self._active_module_idx is not None else None
-            ),
+            "module_name": self._module_name,
+            "sensor_part_code": getattr(self.config, "sensor_part_code", None),
+            "device_id": getattr(self.config, "device_id", None),
             "n_taxels": self._n_taxels,
             "output_format": self.config.output_format,
             "auto_calibrate": self.config.auto_calibrate,

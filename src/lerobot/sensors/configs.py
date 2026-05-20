@@ -99,3 +99,31 @@ class PaxiniSensorConfig(SensorConfig):
     # `lerobot-record --display_data=true` viewer. Best-effort: if rerun
     # isn't initialized yet, the calls silently no-op.
     display_rerun: bool = False
+
+    # Which communication board the sensor is attached to:
+    #   "high_speed" -> High-Speed Communication Board: auto-push stream,
+    #                   ~91 Hz, up to 28 modules, reports point counts.
+    #   "serial"     -> Serial Converter Board: one sensor, request/response
+    #                   only (~8-16 Hz), cannot report its sensor's model.
+    board_type: str = "high_speed"
+
+    # Serial Converter Board only: vendor part code of the attached sensor
+    # (e.g. "PXSR-STDDP03A"). REQUIRED when board_type="serial" because that
+    # board has no point-count register. Ignored for the High-Speed board,
+    # which reads the point count from register 0x0030.
+    sensor_part_code: str | None = None
+
+    # Serial Converter Board only: slave address = module number + 1.
+    # Default 0x01 (module number 0, sensor on the default CN1 port).
+    device_id: int = 0x01
+
+    # Lock the sensor's sample rate to a fixed value in Hz -- a stable,
+    # deterministic cadence on both boards, the same idea as the Teensy
+    # giving the MLX hall sensor a fixed rate.
+    #   * Serial Converter Board: the request/response poll loop sleeps the
+    #     remainder of each 1/rate period.
+    #   * High-Speed board: the ~91 Hz auto-push stream is downsampled --
+    #     exactly one frame per 1/rate period is recorded, the rest dropped.
+    # 0.0 = use the board's native rate (serial: as fast as it answers;
+    # high-speed: the full ~91 Hz auto-push rate).
+    poll_rate_hz: float = 0.0
