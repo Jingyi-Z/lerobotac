@@ -29,17 +29,43 @@
 ## About this fork
 
 `lerobotac` extends Hugging Face LeRobot with a generic sensor framework
-(`FeatureType.SENSOR`) and a concrete MLX90393 Hall-effect magnetometer
-driver for tactile sensing on the SO-101 follower. Documentation lives in
-the companion repo:
+(`FeatureType.SENSOR`) and two concrete tactile-sensor drivers for the
+SO-101 follower:
+
+- **MLX90393** — a Hall-effect magnetometer behind a soft gripper pad,
+  streamed from a Teensy over USB serial.
+- **Paxini PX-6AX GEN3** — a multidimensional tactile sensor (3-axis force
+  per taxel, 9–239 taxels depending on variant), driven through the
+  [paxini-sdk](https://github.com/Jingyi-Z/paxini-sdk) wrapper. Both Paxini
+  communication boards are supported — the High-Speed Communication Board
+  (auto-push, ~91 Hz) and the Serial Converter Board (request/response).
+
+Documentation lives in the companion repo:
 
 - Hardware setup and dataset workflow: [robotics_notes](https://github.com/Jingyi-Z/robotics_notes)
-- Tactile sensor integration: [robotics_notes/docs/06_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md)
+- MLX90393 Hall sensor: [robotics_notes/docs/06_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md)
+- Paxini PX-6AX GEN3 sensor: [robotics_notes/docs/07_paxini_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/07_paxini_tactile_sensor.md)
 
 ### Branches
 
 - `main` — tracks upstream `huggingface/lerobot`
-- `hall-sensor` — adds the sensor framework and the MLX90393 driver
+- `hall-sensor` — adds the sensor framework plus the MLX90393 and Paxini
+  PX-6AX GEN3 drivers
+
+### Sensor configuration
+
+Sensors are declared on the `so_sensor_follower` robot via `--robot.sensors`;
+each records into the dataset at `observation.sensors.<name>`. Both sensor
+types can be used at once. Example — a Paxini fingertip and an MLX gripper
+sensor together:
+
+```
+--robot.sensors='{gripper: {type: mlx90393, port: /dev/cu.usbmodem197004501}, paxini_fingertip: {type: paxini, board_type: high_speed, port: /dev/cu.usbmodemD3BB68743E521, output_format: distributed, poll_rate_hz: 30}}'
+```
+
+For the Paxini Serial Converter Board, set `board_type: serial` and supply
+`sensor_part_code` (that board cannot report its sensor model). See Doc #07
+for the full recording workflow.
 
 ### Adding a new sensor
 
