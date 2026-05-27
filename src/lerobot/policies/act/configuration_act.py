@@ -13,11 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, field
 
-from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig
-
+from lerobot.utils.constants import OBS_ENV_STATE
 
 @PreTrainedConfig.register_subclass("act")
 @dataclass
@@ -89,6 +90,8 @@ class ACTConfig(PreTrainedConfig):
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MEAN_STD,
+            "ENV": NormalizationMode.MEAN_STD,
+            "SENSOR": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
@@ -98,6 +101,18 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # Tactile backbone.
+    tactile_as_env_state: bool = False
+    tactile_features: list[str] = field(default_factory=list)
+    tactile_env_state_keys: list[str] = field(default_factory=list)
+    tactile_env_state_shapes: list[list[int]] = field(default_factory=list)
+
+    use_tactile: bool = False  # Whether to use tactile inputs at all. If False, the above tactile-related parameters are ignored and no tactile backbone is used.
+    tactile_encoder: str = "linear" # linear | mlp | cnn | tcn | transformer
+    tactile_hidden_dim: int = 256
+    tactile_num_layers: int = 2
+    tactile_dropout: float = 0.1
+
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -126,11 +141,22 @@ class ACTConfig(PreTrainedConfig):
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
+    
 
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.use_tactile and self.tactile_as_env_state:
+            raise ValueError(
+                "Set only one of `use_tactile` or `tactile_as_env_state`."
+            )
+        valid_encoders = ("linear", "mlp", "cnn", "tcn", "transformer")
+        if self.use_tactile and self.tactile_encoder not in valid_encoders:
+            raise ValueError(
+                f"`tactile_encoder` must be one of {valid_encoders}. Got "
+                f"{self.tactile_encoder!r}."
+            ) 
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -162,6 +188,11 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_tactile and not self.sensor_features:
+            raise ValueError(
+                "`use_tactile=True` but no tactile features (`observation.sensors.*`) "
+                "were found among the inputs. Check the dataset, or disable `use_tactile`."
+            )
 
     @property
     def observation_delta_indices(self) -> None:
@@ -174,3 +205,34 @@ class ACTConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+    
+def fold_tactile_into_env_state(config: ACTConfig) -> None:
+    """Idempotently fold `observation.sensors.*` features into `observation.environment_state`."""
+    if not config.tactile_as_env_state or not config.input_features:
+        return
+    if config.tactile_env_state_keys and OBS_ENV_STATE in config.input_features:
+        return  # already folded
+    sensor_keys = [
+        key for key, ft in config.input_features.items() if ft.type is FeatureType.SENSOR
+    ]
+    if config.tactile_features:
+        sensor_keys = [key for key in config.tactile_features if key in sensor_keys]
+    if not sensor_keys:
+        return
+    shapes = [list(config.input_features[key].shape) for key in sensor_keys]
+    total_dim = sum(math.prod(shape) for shape in shapes)
+    for key in sensor_keys:
+        del config.input_features[key]
+    config.input_features[OBS_ENV_STATE] = PolicyFeature(
+        type=FeatureType.ENV, shape=(total_dim,)
+    )
+    config.tactile_env_state_keys = sensor_keys
+    config.tactile_env_state_shapes = shapes
+
+
+def resolve_tactile_keys(config: ACTConfig) -> list[str]:
+    """Tactile sensor feature keys the dedicated tactile encoder will use."""
+    keys = list(config.sensor_features.keys())
+    if config.tactile_features:
+        keys = [key for key in config.tactile_features if key in keys]
+    return keys

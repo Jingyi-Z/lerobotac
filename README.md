@@ -44,7 +44,7 @@ Documentation lives in the companion repo:
 
 - Hardware setup and dataset workflow: [robotics_notes](https://github.com/Jingyi-Z/robotics_notes)
 - MLX90393 Hall sensor: [robotics_notes/docs/06_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md)
-- Paxini PX-6AX GEN3 sensor: [robotics_notes/docs/07_paxini_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/07_paxini_tactile_sensor.md)
+- Paxini PX-6AX GEN3 sensor: [robotics_notes/docs/08_paxini_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/08_paxini_tactile_sensor.md)
 
 ### Branches
 
@@ -64,7 +64,7 @@ sensor together:
 ```
 
 For the Paxini Serial Converter Board, set `board_type: serial` and supply
-`sensor_part_code` (that board cannot report its sensor model). See Doc #07
+`sensor_part_code` (that board cannot report its sensor model). See Doc #08
 for the full recording workflow.
 
 ### Adding a new sensor

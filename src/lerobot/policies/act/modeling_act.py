@@ -36,8 +36,8 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
-from .configuration_act import ACTConfig
-
+from .configuration_act import ACTConfig, fold_tactile_into_env_state, resolve_tactile_keys
+from .tactile_encoder import make_tactile_encoder
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -59,6 +59,7 @@ class ACTPolicy(PreTrainedPolicy):
                     the configuration class is used.
         """
         super().__init__(config)
+        fold_tactile_into_env_state(config)
         config.validate_features()
         self.config = config
 
@@ -347,6 +348,16 @@ class ACT(nn.Module):
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
             )
+        if self.config.use_tactile:
+            self.tactile_keys = resolve_tactile_keys(config)
+            self.tactile_encoder = make_tactile_encoder(
+                encoder=config.tactile_encoder,
+                sensor_features={k: config.sensor_features[k] for k in self.tactile_keys},
+                dim_model=config.dim_model,
+                hidden_dim=config.tactile_hidden_dim,
+                num_layers=config.tactile_num_layers,
+                dropout=config.tactile_dropout,
+            )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
@@ -357,6 +368,8 @@ class ACT(nn.Module):
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
+            n_1d_tokens += 1
+        if self.config.use_tactile:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -466,6 +479,10 @@ class ACT(nn.Module):
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        # Tactile token.
+        if self.config.use_tactile:
+            tactile_obs = {key: batch[key] for key in self.tactile_keys}
+            encoder_in_tokens.append(self. tactile_encoder(tactile_obs))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.

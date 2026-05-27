@@ -152,6 +152,13 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
 
     @property
+    def sensor_features(self) -> dict[str, PolicyFeature]:
+        """Non-camera sensor features (e.g. tactile), keyed by `observation.sensors.*`."""
+        if not self.input_features:
+            return {}
+        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.SENSOR}
+    
+    @property
     def action_feature(self) -> PolicyFeature | None:
         if not self.output_features:
             return None

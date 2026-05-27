@@ -93,6 +93,7 @@ from .relative_action_processor import (
     to_relative_actions,
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
+from .tactile_processor import TactileToEnvStateProcessorStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
@@ -145,6 +146,7 @@ __all__ = [
     "RobotObservation",
     "rename_stats",
     "RenameObservationsProcessorStep",
+    "TactileToEnvStateProcessorStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
     "DataProcessorPipeline",

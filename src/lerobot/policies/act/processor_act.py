@@ -1,20 +1,6 @@
-#!/usr/bin/env python
-
-# Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.processor import (
@@ -24,51 +10,99 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
+    TactileToEnvStateProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
 )
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    OBS_ENV_STATE,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
-from .configuration_act import ACTConfig
+from .configuration_act import ACTConfig, fold_tactile_into_env_state
+
+_FOLDABLE_STAT_NAMES = ("mean", "std", "min", "max", "q01", "q99", "q10", "q90")
 
 
-def make_act_pre_post_processors(
-    config: ACTConfig,
-    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-) -> tuple[
-    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
-]:
-    """Creates the pre- and post-processing pipelines for the ACT policy.
+def _build_tactile_env_state_stats(config, dataset_stats):
+    """Remap per-sensor dataset stats to flat `observation.environment_state` stats.
 
-    The pre-processing pipeline handles normalization, batching, and device placement for the model inputs.
-    The post-processing pipeline handles unnormalization and moves the model outputs back to the CPU.
-
-    Args:
-        config (ACTConfig): The ACT policy configuration object.
-        dataset_stats (dict[str, dict[str, torch.Tensor]] | None): A dictionary containing dataset
-            statistics (e.g., mean and std) used for normalization. Defaults to None.
-
-    Returns:
-        tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
-        pre-processor pipeline and the post-processor pipeline.
+    The normalizer expects statistics keyed by the *folded* feature name. This
+    flattens each per-sensor stat array and concatenates them in the same order
+    the fold uses on the tensors. If anything doesn't line up cleanly, the
+    function returns the original dataset_stats unchanged (env-state then passes
+    through unnormalized rather than crashing).
     """
+    if not dataset_stats or not config.tactile_env_state_keys:
+        return dataset_stats
+    keys = config.tactile_env_state_keys
+    if not all(key in dataset_stats for key in keys):
+        return dataset_stats
+
+    expected_dim = sum(
+        int(np.prod(s)) if len(s) else 1 for s in config.tactile_env_state_shapes
+    )
+    merged = {}
+    for stat_name in _FOLDABLE_STAT_NAMES:
+        if not all(stat_name in dataset_stats[key] for key in keys):
+            continue
+        parts = [np.asarray(dataset_stats[key][stat_name]).reshape(-1) for key in keys]
+        concatenated = np.concatenate(parts)
+        if concatenated.shape[0] == expected_dim:
+            merged[stat_name] = concatenated
+
+    if "mean" not in merged or "std" not in merged:
+        return dataset_stats
+
+    new_stats = dict(dataset_stats)
+    new_stats[OBS_ENV_STATE] = merged
+    return new_stats
+
+
+def make_act_pre_post_processors(config: ACTConfig, dataset_stats=None):
+    """Build ACT's pre- and post-processing pipelines.
+
+    Pre-processing: rename -> add batch dim -> place on device -> (optional)
+    fold tactile into env-state -> normalize.
+    Post-processing: unnormalize action -> move to CPU.
+    """
+    # Idempotent — also called from ACTPolicy.__init__ in Step 8.
+    fold_tactile_into_env_state(config)
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+
+    norm_stats = dataset_stats
+    if config.tactile_as_env_state and config.tactile_env_state_keys:
+        input_steps.append(
+            TactileToEnvStateProcessorStep(
+                sensor_keys=list(config.tactile_env_state_keys),
+                sensor_shapes=[list(s) for s in config.tactile_env_state_shapes],
+                env_state_key=OBS_ENV_STATE,
+                drop_sensor_keys=True,
+            )
+        )
+        norm_stats = _build_tactile_env_state_stats(config, dataset_stats)
+
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
+            stats=norm_stats,
             device=config.device,
-        ),
-    ]
+        )
+    )
+
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
         ),
         DeviceProcessorStep(device="cpu"),
     ]

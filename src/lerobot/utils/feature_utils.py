@@ -27,7 +27,7 @@ import numpy as np
 
 from lerobot.configs import FeatureType, PolicyFeature
 
-from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STR
+from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STR, OBS_SENSORS
 
 
 def _validate_feature_names(features: dict[str, dict]) -> None:
@@ -184,6 +184,8 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
                 shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
+        elif key.startswith(f"{OBS_SENSORS}."):
+            type = FeatureType.SENSOR
         elif key.startswith(OBS_STR):
             type = FeatureType.STATE
         elif key.startswith(ACTION):
