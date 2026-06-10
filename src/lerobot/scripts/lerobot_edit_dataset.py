@@ -183,6 +183,10 @@ Using JSON config file:
         --config_path path/to/edit_config.json
 """
 
+from datasets.features.features import PandasArrayExtensionDtype
+if isinstance(PandasArrayExtensionDtype._metadata, str):
+    PandasArrayExtensionDtype._metadata = (PandasArrayExtensionDtype._metadata,)
+
 import abc
 import logging
 import shutil
@@ -205,6 +209,7 @@ from lerobot.datasets import (
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
+
 
 
 @dataclass

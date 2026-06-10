@@ -419,6 +419,8 @@ class DatasetWriter:
             self._pq_writer = pq.ParquetWriter(
                 path, schema=table.schema, compression="snappy", use_dictionary=True
             )
+
+        table = table.select(self._pq_writer.schema.names)
         self._pq_writer.write_table(table)
 
         metadata = {

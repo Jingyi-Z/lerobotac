@@ -142,6 +142,9 @@ class LeRobotDatasetMetadata:
                 path, schema=table.schema, compression="snappy", use_dictionary=True
             )
 
+        # Reorder columns to match the writer's locked schema so episodes recorded
+        # with a different stats column order don't trip pyarrow's schema check.
+        table = table.select(self._pq_writer.schema.names)
         self._pq_writer.write_table(table)
 
         self.latest_episode = self._metadata_buffer[-1]
