@@ -49,7 +49,7 @@ def _default_so101_blueprint():
     # Wildcards, not a hardcoded sensor name: this blueprint is built before
     # the sensors are known, and there may be one or several Paxini sensors
     # with arbitrary names (paxini_gripper, paxini_wrist_roll, ...). Matching
-    # everything under /observation.sensors makes the panels adapt to whatever
+    # everything under /observation/sensors makes the panels adapt to whatever
     # is configured. TimeSeriesView renders only the scalar series (sum_* and
     # resultant/*); Spatial3DView renders only the Points3D (anatomy +
     # distributed). Multiple fingertips share coordinates so their clouds
@@ -57,12 +57,12 @@ def _default_so101_blueprint():
     # entity path so the two fingertips stay distinguishable there.
     paxini_forces = rrb.TimeSeriesView(
         name="Paxini forces (N)",
-        contents=["/observation.sensors/**"],
+        contents=["/observation/sensors/**"],
     )
     paxini_3d = rrb.Spatial3DView(
         name="Paxini fingertips",
-        origin="/observation.sensors",
-        contents=["/observation.sensors/**"],
+        origin="/observation/sensors",
+        contents=["/observation/sensors/**"],
     )
 
     wrist_cam = rrb.Spatial2DView(name="Wrist", origin="/observation.wrist")
@@ -215,9 +215,17 @@ def log_rerun_data(
                     # `observation.sensors.{name}/distributed` when
                     # `display_rerun: true`.
                     latest = arr[-1]
-                    rr.log(f"{key}/sum_fx", rr.Scalars(float(latest[:, 0].sum())))
-                    rr.log(f"{key}/sum_fy", rr.Scalars(float(latest[:, 1].sum())))
-                    rr.log(f"{key}/sum_fz", rr.Scalars(float(latest[:, 2].sum())))
+                    # Slashify the tactile key so its scalars land in the same
+                    # /observation/sensors/<name>/ subtree as the sensor's own
+                    # 3D point-cloud logging (PaxiniSensor._log_to_rerun) and
+                    # are matched by the default blueprint's
+                    # /observation/sensors/** wildcard. Only this (N, P, 3)
+                    # tactile branch is slashified; joints and images keep
+                    # their dotted paths.
+                    skey = str(key).replace(".", "/")
+                    rr.log(f"{skey}/sum_fx", rr.Scalars(float(latest[:, 0].sum())))
+                    rr.log(f"{skey}/sum_fy", rr.Scalars(float(latest[:, 1].sum())))
+                    rr.log(f"{skey}/sum_fz", rr.Scalars(float(latest[:, 2].sum())))
                 else:
                     img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
                     rr.log(key, entity=img_entity, static=True)

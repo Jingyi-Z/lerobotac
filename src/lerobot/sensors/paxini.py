@@ -469,7 +469,12 @@ class PaxiniSensor(Sensor):
                 return
             self._rerun_coords = sensor_registry.load_points(variant)
             if self._sensor_name:
-                self._rerun_log_path = f"observation.sensors.{self._sensor_name}"
+                # Slash-separated so the entity tree is a real hierarchy
+                # (/observation/sensors/<name>/...). rerun splits paths on "/"
+                # only, so a dotted "observation.sensors.<name>" would be ONE
+                # opaque part that /observation/sensors/** can't match. See the
+                # default blueprint in visualization_utils.py.
+                self._rerun_log_path = f"observation/sensors/{self._sensor_name}"
             else:
                 safe = (self._module_name or "paxini").lower().replace("-", "_")
                 self._rerun_log_path = f"sensor/{safe}"
