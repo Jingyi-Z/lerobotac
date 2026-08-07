@@ -46,21 +46,23 @@ def _default_so101_blueprint():
     """
     import rerun.blueprint as rrb
 
-    paxini_root = "/observation.sensors.paxini_fingertip"
-
+    # Wildcards, not a hardcoded sensor name: this blueprint is built before
+    # the sensors are known, and there may be one or several Paxini sensors
+    # with arbitrary names (paxini_gripper, paxini_wrist_roll, ...). Matching
+    # everything under /observation.sensors makes the panels adapt to whatever
+    # is configured. TimeSeriesView renders only the scalar series (sum_* and
+    # resultant/*); Spatial3DView renders only the Points3D (anatomy +
+    # distributed). Multiple fingertips share coordinates so their clouds
+    # overlap in 3D, but the forces panel labels each series by its full
+    # entity path so the two fingertips stay distinguishable there.
     paxini_forces = rrb.TimeSeriesView(
         name="Paxini forces (N)",
-        contents=[
-            f"{paxini_root}/sum_fx",
-            f"{paxini_root}/sum_fy",
-            f"{paxini_root}/sum_fz",
-            f"{paxini_root}/resultant/**",
-        ],
+        contents=["/observation.sensors/**"],
     )
     paxini_3d = rrb.Spatial3DView(
-        name="Paxini fingertip",
-        origin=paxini_root,
-        contents=[f"{paxini_root}/anatomy", f"{paxini_root}/distributed"],
+        name="Paxini fingertips",
+        origin="/observation.sensors",
+        contents=["/observation.sensors/**"],
     )
 
     wrist_cam = rrb.Spatial2DView(name="Wrist", origin="/observation.wrist")
