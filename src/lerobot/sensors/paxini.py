@@ -155,13 +155,32 @@ class _SharedHighSpeedBoard:
         self._board = HighSpeedHandBoard(self.port, baudrate=self.baudrate)
         self._board.open()
         self.active_modules = list(self._board.read_active_modules())
+        # Pre-read every active module's distributed-force point count NOW,
+        # while the board is quiet. Once the auto-push stream starts the port
+        # is saturated with AA56 frames, and any later request/response read
+        # (e.g. a second sensor calling point_count) collides with the stream
+        # -- "short read" / "frame head aa55 not found". Caching all counts up
+        # front means every sensor's connect() after the stream is running is
+        # a pure cache hit with zero board I/O.
+        for m in self.active_modules:
+            self._point_counts[m] = self._board.read_distribution_point_count(m)
 
     def point_count(self, module_idx: int) -> int:
         with self._lock:
-            if module_idx not in self._point_counts:
-                self._point_counts[module_idx] = (
-                    self._board.read_distribution_point_count(module_idx)
+            if module_idx in self._point_counts:
+                return self._point_counts[module_idx]
+            # Not pre-cached (module wasn't in the active list at open). Only
+            # safe to read if the auto-push stream hasn't started yet.
+            if self._stream_thread is not None and self._stream_thread.is_alive():
+                raise RuntimeError(
+                    f"Paxini: point count for module {module_idx} was not "
+                    "cached before the shared auto-push stream started; cannot "
+                    "read it now without corrupting the stream. This usually "
+                    "means the module is not in the board's active-module list."
                 )
+            self._point_counts[module_idx] = (
+                self._board.read_distribution_point_count(module_idx)
+            )
             return self._point_counts[module_idx]
 
     def claim_module(self, module_idx: int, label: str) -> None:
