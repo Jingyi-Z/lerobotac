@@ -17,10 +17,28 @@ Two communication boards are supported, selected via the config's
 ``board_type`` field:
 
 * ``"high_speed"`` -- High-Speed Communication Board. Auto-push streaming at
-  ~91 Hz; reports its sensor's point count from a register.
+  ~91 Hz; reports its sensor's point count from a register. Up to 28 modules
+  (finger segments + palm) can be plugged into one board.
 * ``"serial"``     -- Serial Converter Board. Request/response only (~8-16 Hz,
   no auto-push); cannot report the sensor model, so ``sensor_part_code`` must
   be supplied in the config.
+
+Multiple sensors on one High-Speed board
+----------------------------------------
+The High-Speed board can carry several sensors at once (e.g. two fingertips
+in the "middle finger" and "little finger" slots). To record them together,
+declare one ``--robot.sensors`` entry per module, all pointing at the SAME
+port but with different ``module_index`` values::
+
+    --robot.sensors='{
+      paxini_gripper:    {type: paxini, port: COM10, module_index: 10, ...},
+      paxini_wrist_roll: {type: paxini, port: COM10, module_index: 18, ...}
+    }'
+
+Under the hood every ``PaxiniSensor`` on the same port shares ONE
+``HighSpeedHandBoard`` and ONE auto-push stream (a serial port can only be
+opened once, and one stream can only be consumed once). Each sensor pulls its
+own module's forces out of every shared frame. See ``_SharedHighSpeedBoard``.
 
 Three output modes (config ``output_format``):
 
@@ -38,7 +56,7 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Deque, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -55,11 +73,171 @@ _ResN = Optional[Tuple[float, float, float]]
 _DistN = Optional[List[Tuple[float, float, float]]]
 
 
+# ===========================================================================
+# Shared High-Speed board — one board + one stream per physical serial port
+# ===========================================================================
+
+_SHARED_REGISTRY: "Dict[Tuple[str, int], _SharedHighSpeedBoard]" = {}
+_SHARED_REGISTRY_LOCK = threading.Lock()
+
+
+class _SharedHighSpeedBoard:
+    """One ``HighSpeedHandBoard`` shared by every ``PaxiniSensor`` on the same
+    serial port.
+
+    A serial port can only be opened once and its auto-push stream can only be
+    consumed by one reader, so when two sensors point at the same port they
+    must share a single board and a single stream thread. This class owns:
+
+    * the board object and its lifetime (refcounted; closed when the last
+      sensor releases it),
+    * one background thread that reads the auto-push stream and fans each
+      frame out to every attached per-sensor callback,
+    * a one-shot firmware calibration (the board zeroes all active modules at
+      once, so it is triggered only once no matter how many sensors ask).
+
+    Instances are obtained via :meth:`acquire` and returned via
+    :meth:`release`; never constructed directly by callers.
+    """
+
+    def __init__(self, port: str, baudrate: int):
+        self.port = port
+        self.baudrate = baudrate
+        self._board = None
+        self._refcount = 0
+        self._lock = threading.Lock()          # guards board I/O + flags
+        self._readers_lock = threading.Lock()  # guards the callback list
+        self._readers: "List[Callable]" = []
+        self._stream_stop = threading.Event()
+        self._stream_thread: Optional[threading.Thread] = None
+        self._calibrated = False
+        self._point_counts: Dict[int, int] = {}
+        self._claimed: Dict[int, str] = {}     # module_idx -> sensor label
+        self.active_modules: List[int] = []
+
+    # ---- acquire / release (refcounted, registry-managed) ------------------
+
+    @classmethod
+    def acquire(cls, port: str, baudrate: int) -> "_SharedHighSpeedBoard":
+        key = (port, baudrate)
+        with _SHARED_REGISTRY_LOCK:
+            shared = _SHARED_REGISTRY.get(key)
+            if shared is None:
+                shared = cls(port, baudrate)
+                shared._open()
+                _SHARED_REGISTRY[key] = shared
+            shared._refcount += 1
+            return shared
+
+    def release(self) -> None:
+        with _SHARED_REGISTRY_LOCK:
+            self._refcount -= 1
+            if self._refcount > 0:
+                return
+            _SHARED_REGISTRY.pop((self.port, self.baudrate), None)
+        # Last sensor out: stop the stream and close the board.
+        self._stream_stop.set()
+        if self._stream_thread and self._stream_thread.is_alive():
+            self._stream_thread.join(timeout=2.0)
+        self._stream_thread = None
+        if self._board is not None:
+            try:
+                self._board.close()
+            except Exception:
+                pass
+            self._board = None
+
+    # ---- board setup -------------------------------------------------------
+
+    def _open(self) -> None:
+        from paxini_sdk import HighSpeedHandBoard
+
+        self._board = HighSpeedHandBoard(self.port, baudrate=self.baudrate)
+        self._board.open()
+        self.active_modules = list(self._board.read_active_modules())
+
+    def point_count(self, module_idx: int) -> int:
+        with self._lock:
+            if module_idx not in self._point_counts:
+                self._point_counts[module_idx] = (
+                    self._board.read_distribution_point_count(module_idx)
+                )
+            return self._point_counts[module_idx]
+
+    def claim_module(self, module_idx: int, label: str) -> None:
+        """Record which sensor owns a module; warn on a double-claim (two
+        sensors reading the same module on the same board is almost always a
+        config mistake — e.g. both left at module_index=None)."""
+        with self._lock:
+            prev = self._claimed.get(module_idx)
+            if prev is not None and prev != label:
+                logging.warning(
+                    f"Paxini: module {module_idx} is claimed by both "
+                    f"{prev!r} and {label!r} on port {self.port}. Both will "
+                    "record identical data — set distinct module_index values."
+                )
+            self._claimed[module_idx] = label
+
+    def request_calibration(self) -> None:
+        """Trigger firmware calibration once for the whole board. The board
+        zeroes all active modules together, so repeated requests are no-ops.
+        Must be called before the stream thread starts (it shares the port)."""
+        with self._lock:
+            if self._calibrated:
+                return
+            self._board.calibrate()
+            self._calibrated = True
+
+    # ---- stream fan-out ----------------------------------------------------
+
+    def attach_reader(self, callback: Callable) -> None:
+        with self._readers_lock:
+            if callback not in self._readers:
+                self._readers.append(callback)
+
+    def detach_reader(self, callback: Callable) -> None:
+        with self._readers_lock:
+            if callback in self._readers:
+                self._readers.remove(callback)
+
+    def ensure_stream_started(self) -> None:
+        with self._lock:
+            if self._stream_thread and self._stream_thread.is_alive():
+                return
+            self._stream_stop.clear()
+            self._stream_thread = threading.Thread(
+                target=self._stream_loop, daemon=True
+            )
+            self._stream_thread.start()
+            logging.info(
+                f"Paxini: shared auto-push stream started on {self.port}"
+            )
+
+    def _stream_loop(self) -> None:
+        try:
+            for frame in self._board.stream_auto_push(per_frame_timeout=0.2):
+                if self._stream_stop.is_set():
+                    break
+                with self._readers_lock:
+                    readers = list(self._readers)
+                for cb in readers:
+                    try:
+                        cb(frame)
+                    except Exception:
+                        logging.exception(
+                            "Paxini: shared-board reader callback failed"
+                        )
+        except Exception as e:
+            logging.exception(f"Paxini: shared-board stream terminated: {e}")
+
+
 class PaxiniSensor(Sensor):
     """Driver for a Paxini PX-6AX GEN3 tactile sensor via paxini-sdk.
 
     Supports both the High-Speed Communication Board and the single-channel
-    Serial Converter Board (``config.board_type``).
+    Serial Converter Board (``config.board_type``). Multiple instances on the
+    same High-Speed board port share one board + stream (see
+    ``_SharedHighSpeedBoard``).
     """
 
     def __init__(self, config: PaxiniSensorConfig):
@@ -81,16 +259,22 @@ class PaxiniSensor(Sensor):
                 "(expected 'high_speed' or 'serial')"
             )
 
-        self._board = None              # HighSpeedHandBoard or SingleSensorBoard
+        self._board = None              # SingleSensorBoard (serial only)
+        self._shared: Optional[_SharedHighSpeedBoard] = None  # high_speed only
+        self._reader_attached = False
         self._is_connected = False
         self._stop_event = threading.Event()
-        self._data_thread: threading.Thread | None = None
+        self._data_thread: threading.Thread | None = None   # serial only
         self._data_lock = threading.Lock()
         self._ring: Deque[np.ndarray] = deque(maxlen=config.buffer_size)
         self._sample_dim = None         # int, or (P, 3) tuple for distributed
         self._active_module_idx: int | None = None   # high-speed only
         self._module_name: str | None = None         # high-speed module / serial label
         self._n_taxels: int | None = None
+
+        # High-speed downsampling state (set in start_continuous_read).
+        self._period = 0.0
+        self._last_ingest = 0.0
 
         # Optional software baseline (atop the firmware calibration)
         self._sw_baseline: Optional[np.ndarray] = None
@@ -179,41 +363,47 @@ class PaxiniSensor(Sensor):
         self._preload_rerun_coords()
 
     def _connect_high_speed(self) -> None:
-        from paxini_sdk import HighSpeedHandBoard, registers
+        from paxini_sdk import registers
 
-        self._board = HighSpeedHandBoard(
-            self.config.port, baudrate=self.config.baud_rate
+        # Acquire (or create) the shared board for this port. The first sensor
+        # on the port opens it and reads the active-modules list; later
+        # sensors reuse it.
+        self._shared = _SharedHighSpeedBoard.acquire(
+            self.config.port, self.config.baud_rate
         )
-        self._board.open()
-        active = self._board.read_active_modules()
-        if not active:
-            self._board.close()
-            self._board = None
-            raise RuntimeError(
-                "No active Paxini modules detected. Check the FPC cable orientation."
-            )
-
-        if self.config.module_index is None:
-            self._active_module_idx = active[0]
-        else:
-            if self.config.module_index not in active:
-                self._board.close()
-                self._board = None
+        try:
+            active = self._shared.active_modules
+            if not active:
                 raise RuntimeError(
-                    f"Requested module {self.config.module_index} "
-                    f"({registers.MODULE_NAMES[self.config.module_index]}) "
-                    f"not active; active list is {active}."
+                    "No active Paxini modules detected. Check the FPC cable "
+                    "orientation."
                 )
-            self._active_module_idx = self.config.module_index
 
-        self._module_name = registers.MODULE_NAMES[self._active_module_idx]
-        self._n_taxels = self._board.read_distribution_point_count(
-            self._active_module_idx
-        )
+            if self.config.module_index is None:
+                self._active_module_idx = active[0]
+            else:
+                if self.config.module_index not in active:
+                    raise RuntimeError(
+                        f"Requested module {self.config.module_index} "
+                        f"({registers.MODULE_NAMES[self.config.module_index]}) "
+                        f"not active; active list is {active}."
+                    )
+                self._active_module_idx = self.config.module_index
 
-        if self.config.auto_calibrate:
-            logging.info("Paxini: triggering firmware calibration ...")
-            self._board.calibrate()
+            self._module_name = registers.MODULE_NAMES[self._active_module_idx]
+            self._shared.claim_module(
+                self._active_module_idx, self._sensor_name or self._module_name
+            )
+            self._n_taxels = self._shared.point_count(self._active_module_idx)
+
+            if self.config.auto_calibrate:
+                logging.info("Paxini: triggering firmware calibration ...")
+                self._shared.request_calibration()
+        except Exception:
+            # Don't leak a refcount if setup fails after acquire().
+            self._shared.release()
+            self._shared = None
+            raise
 
     def _connect_serial(self) -> None:
         from paxini_sdk import SingleSensorBoard, sensor_registry
@@ -274,12 +464,17 @@ class PaxiniSensor(Sensor):
 
     def disconnect(self) -> None:
         self.stop_continuous_read()
-        if self._board is not None:
-            try:
-                self._board.close()
-            except Exception:
-                pass
-        self._board = None
+        if self._board_type == "serial":
+            if self._board is not None:
+                try:
+                    self._board.close()
+                except Exception:
+                    pass
+                self._board = None
+        else:
+            if self._shared is not None:
+                self._shared.release()
+                self._shared = None
         self._is_connected = False
         logging.info("Disconnected from Paxini sensor")
 
@@ -288,53 +483,59 @@ class PaxiniSensor(Sensor):
     def start_continuous_read(self) -> None:
         if not self._is_connected:
             raise RuntimeError("Sensor must be connected before start_continuous_read()")
-        if self._data_thread and self._data_thread.is_alive():
-            return
         self._stop_event.clear()
-        self._data_thread = threading.Thread(
-            target=self._continuous_read_loop, daemon=True
-        )
-        self._data_thread.start()
+
+        if self._board_type == "serial":
+            if self._data_thread and self._data_thread.is_alive():
+                return
+            self._data_thread = threading.Thread(
+                target=self._continuous_read_loop, daemon=True
+            )
+            self._data_thread.start()
+        else:
+            # High-speed: attach this sensor's per-frame callback to the shared
+            # stream and make sure the shared stream thread is running.
+            rate = max(0.0, float(getattr(self.config, "poll_rate_hz", 0.0)))
+            self._period = (1.0 / rate) if rate > 0 else 0.0
+            self._last_ingest = 0.0
+            if self._shared is not None:
+                self._shared.attach_reader(self._on_frame)
+                self._reader_attached = True
+                self._shared.ensure_stream_started()
         logging.info("Started Paxini sensor continuous read")
 
     def stop_continuous_read(self) -> None:
-        if self._data_thread and self._data_thread.is_alive():
-            self._stop_event.set()
-            self._data_thread.join(timeout=2.0)
-        self._data_thread = None
+        self._stop_event.set()
+        if self._board_type == "serial":
+            if self._data_thread and self._data_thread.is_alive():
+                self._data_thread.join(timeout=2.0)
+            self._data_thread = None
+        else:
+            if self._reader_attached and self._shared is not None:
+                self._shared.detach_reader(self._on_frame)
+                self._reader_attached = False
+
+    def _on_frame(self, frame) -> None:
+        """Per-frame callback invoked by the shared board's stream thread.
+        Applies this sensor's poll-rate downsampling, extracts this sensor's
+        module from the shared frame, and ingests it."""
+        if self._stop_event.is_set():
+            return
+        if self._period:
+            now = time.monotonic()
+            if now - self._last_ingest < self._period:
+                return  # drop; keep the ring at the target rate
+            self._last_ingest = now
+        res_n = frame.resultant_forces_newtons.get(self._module_name)
+        dist_n = frame.distributed_forces_newtons.get(self._module_name) or None
+        self._ingest(res_n, dist_n)
 
     def _continuous_read_loop(self) -> None:
+        # Serial board only (high-speed uses the shared stream + _on_frame).
         try:
-            if self._board_type == "serial":
-                self._serial_read_loop()
-            else:
-                self._high_speed_read_loop()
+            self._serial_read_loop()
         except Exception as e:
             logging.exception(f"Paxini read loop terminated: {e}")
-
-    def _high_speed_read_loop(self) -> None:
-        """Consume the High-Speed board's auto-push stream (~91 Hz).
-
-        If config.poll_rate_hz > 0 the stream is downsampled to that rate:
-        every frame is still pulled off the wire (so the serial buffer stays
-        drained), but only one frame per 1/rate period is recorded. This
-        gives the same fixed, deterministic cadence as the serial board's
-        rate lock. poll_rate_hz = 0 records every frame at the native rate."""
-        module_name = self._module_name
-        rate = max(0.0, float(getattr(self.config, "poll_rate_hz", 0.0)))
-        period = (1.0 / rate) if rate > 0 else 0.0
-        last_ingest = 0.0
-        for frame in self._board.stream_auto_push(per_frame_timeout=0.2):
-            if self._stop_event.is_set():
-                break
-            if period:
-                now = time.monotonic()
-                if now - last_ingest < period:
-                    continue  # drop this frame; keeps the ring at target rate
-                last_ingest = now
-            res_n = frame.resultant_forces_newtons.get(module_name)
-            dist_n = frame.distributed_forces_newtons.get(module_name) or None
-            self._ingest(res_n, dist_n)
 
     def _serial_read_loop(self) -> None:
         """Poll the Serial Converter Board (request/response).
