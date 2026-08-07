@@ -33,37 +33,52 @@ _SO101_JOINTS = (
 )
 
 
-def _default_so101_blueprint():
+def _default_so101_blueprint(paxini_sensor_names=None):
     """Build the default Cowork/SO-101 layout used by ``init_rerun``.
 
     Three rows x two columns:
-      (1) Paxini force time series  |  Paxini 3D point cloud
+      (1) Paxini force time series  |  Paxini fingertip #1 (3D point cloud)
       (2) Wrist camera              |  Top camera
-      (3) Joint positions (all 12)  |  Hall sensor (MLX) 10x3 buffer
+      (3) Joint positions           |  Paxini fingertip #2 (3D) or Hall sensor
 
-    Missing entities render as empty panels - safe to leave in even when
-    the user runs without one of the sensors.
+    ``paxini_sensor_names`` is the list of Paxini sensor dict-keys from the
+    robot config (e.g. ["paxini_gripper", "paxini_wrist_roll"]). When given,
+    each fingertip gets its OWN 3D panel so their point clouds don't overlap:
+    the first goes top-right, the second replaces the bottom-right Hall panel,
+    and any beyond the second are added as tabs alongside it. When it's None
+    or empty (names unknown), one combined wildcard 3D panel is used and the
+    bottom-right shows the Hall (MLX) panel, so single-sensor and MLX-only
+    setups still work.
+
+    Missing entities render as empty panels - safe to leave in.
     """
     import rerun.blueprint as rrb
 
-    # Wildcards, not a hardcoded sensor name: this blueprint is built before
-    # the sensors are known, and there may be one or several Paxini sensors
-    # with arbitrary names (paxini_gripper, paxini_wrist_roll, ...). Matching
-    # everything under /observation/sensors makes the panels adapt to whatever
-    # is configured. TimeSeriesView renders only the scalar series (sum_* and
-    # resultant/*); Spatial3DView renders only the Points3D (anatomy +
-    # distributed). Multiple fingertips share coordinates so their clouds
-    # overlap in 3D, but the forces panel labels each series by its full
-    # entity path so the two fingertips stay distinguishable there.
+    names = list(paxini_sensor_names or [])
+
+    # Forces: all Paxini scalar series (sum_* + resultant/*), labeled per
+    # entity path so multiple fingertips stay distinguishable.
     paxini_forces = rrb.TimeSeriesView(
         name="Paxini forces (N)",
         contents=["/observation/sensors/**"],
     )
-    paxini_3d = rrb.Spatial3DView(
-        name="Paxini fingertips",
-        origin="/observation/sensors",
-        contents=["/observation/sensors/**"],
-    )
+
+    def _fingertip_3d(name):
+        return rrb.Spatial3DView(
+            name=name,
+            origin=f"/observation/sensors/{name}",
+            contents=[f"/observation/sensors/{name}/**"],
+        )
+
+    if names:
+        top_right = _fingertip_3d(names[0])
+    else:
+        # Names unknown: one combined cloud (fingertips overlap, but visible).
+        top_right = rrb.Spatial3DView(
+            name="Paxini fingertips",
+            origin="/observation/sensors",
+            contents=["/observation/sensors/**"],
+        )
 
     wrist_cam = rrb.Spatial2DView(name="Wrist", origin="/observation.wrist")
     top_cam = rrb.Spatial2DView(name="Top", origin="/observation.top")
@@ -73,26 +88,31 @@ def _default_so101_blueprint():
     ]
     joints = rrb.TimeSeriesView(name="Joint positions", contents=joint_contents)
 
-    # MLX gripper buffer as a (10, 3) heatmap; updated per tick by the
-    # ndim==2 branch of `log_rerun_data` below.
-    hall = rrb.Spatial2DView(
-        name="Hall sensor (10x3)",
-        origin="/observation.sensors.gripper/array",
-        contents=["/observation.sensors.gripper/array"],
-    )
+    # Bottom-right: a second fingertip's 3D panel if there is one; otherwise
+    # the MLX Hall-sensor buffer heatmap.
+    if len(names) >= 2:
+        extra = [_fingertip_3d(n) for n in names[1:]]
+        bottom_right = extra[0] if len(extra) == 1 else rrb.Tabs(*extra)
+    else:
+        bottom_right = rrb.Spatial2DView(
+            name="Hall sensor (10x3)",
+            origin="/observation.sensors.gripper/array",
+            contents=["/observation.sensors.gripper/array"],
+        )
 
     return rrb.Blueprint(
         rrb.Vertical(
-            rrb.Horizontal(paxini_forces, paxini_3d),
+            rrb.Horizontal(paxini_forces, top_right),
             rrb.Horizontal(wrist_cam, top_cam),
-            rrb.Horizontal(joints, hall),
+            rrb.Horizontal(joints, bottom_right),
         ),
         collapse_panels=True,
     )
 
 
 def init_rerun(
-    session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
+    session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None,
+    paxini_sensor_names: list | None = None,
 ) -> None:
     """
     Initializes the Rerun SDK for visualizing the control loop.
@@ -101,6 +121,8 @@ def init_rerun(
         session_name: Name of the Rerun session.
         ip: Optional IP for connecting to a Rerun server.
         port: Optional port for connecting to a Rerun server.
+        paxini_sensor_names: Optional list of Paxini sensor dict-keys so the
+            default blueprint can give each fingertip its own 3D panel.
     """
 
     require_package("rerun-sdk", extra="viz", import_name="rerun")
@@ -121,7 +143,7 @@ def init_rerun(
     bp_env = os.getenv("LEROBOT_DEFAULT_BLUEPRINT", "1")
     if bp_env not in ("0", "false", "False"):
         try:
-            rr.send_blueprint(_default_so101_blueprint(), make_active=True, make_default=True)
+            rr.send_blueprint(_default_so101_blueprint(paxini_sensor_names), make_active=True, make_default=True)
         except Exception as e:
             import logging
             logging.warning(f"Skipping default lerobot blueprint: {e}")

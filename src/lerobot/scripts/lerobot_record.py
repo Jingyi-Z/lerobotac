@@ -331,7 +331,21 @@ def record(
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
-        init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+        # Give the rerun blueprint each Paxini fingertip's name so it can build
+        # one 3D panel per sensor instead of a single overlapping cloud.
+        paxini_sensor_names = None
+        try:
+            sensors = getattr(cfg.robot, "sensors", None) or {}
+            paxini_sensor_names = [
+                name for name, scfg in sensors.items()
+                if getattr(scfg, "type", None) == "paxini"
+            ] or None
+        except Exception:
+            paxini_sensor_names = None
+        init_rerun(
+            session_name="recording", ip=cfg.display_ip, port=cfg.display_port,
+            paxini_sensor_names=paxini_sensor_names,
+        )
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
