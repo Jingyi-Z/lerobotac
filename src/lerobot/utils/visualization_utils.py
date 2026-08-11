@@ -68,6 +68,8 @@ def _default_so101_blueprint(paxini_sensor_names=None):
             name=name,
             origin=f"/observation/sensors/{name}",
             contents=[f"/observation/sensors/{name}/**"],
+            background=[15, 15, 18],                       # dark, PXSR-like
+            line_grid=rrb.archetypes.LineGrid3D(visible=False),
         )
 
     if names:
@@ -78,6 +80,8 @@ def _default_so101_blueprint(paxini_sensor_names=None):
             name="Paxini fingertips",
             origin="/observation/sensors",
             contents=["/observation/sensors/**"],
+            background=[15, 15, 18],
+            line_grid=rrb.archetypes.LineGrid3D(visible=False),
         )
 
     wrist_cam = rrb.Spatial2DView(name="Wrist", origin="/observation.wrist")

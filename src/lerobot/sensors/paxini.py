@@ -707,6 +707,11 @@ class PaxiniSensor(Sensor):
             return
         try:
             if not self._rerun_anatomy_logged:
+                # Orient the view Y-up so the fingertip stands upright and
+                # faces the camera, matching the PXSR host app (the sensor's
+                # long axis is +Y, width is X, dome bulge is Z).
+                rr.log(self._rerun_log_path,
+                       rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
                 # Faint backdrop so the fingertip shape is always visible,
                 # even with no contact. Static so it's logged once.
                 pale = [(150, 155, 165)] * len(self._rerun_coords)
