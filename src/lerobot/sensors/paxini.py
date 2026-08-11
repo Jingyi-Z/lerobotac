@@ -677,10 +677,28 @@ class PaxiniSensor(Sensor):
             return np.concatenate([arr, pad], axis=0)
         return arr[: self._n_taxels]
 
+    @staticmethod
+    def _force_colormap(t: float):
+        """green -> yellow -> orange -> red ramp for a normalized force t in
+        [0, 1], matching the PXSR host app's magnitude scale."""
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        # stops: 0.0 green, 0.4 yellow, 0.7 orange, 1.0 red
+        stops = [(0.0, (0, 180, 40)), (0.4, (235, 235, 0)),
+                 (0.7, (245, 140, 0)), (1.0, (220, 0, 0))]
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t <= t1:
+                f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                return (round(c0[0] + (c1[0] - c0[0]) * f),
+                        round(c0[1] + (c1[1] - c0[1]) * f),
+                        round(c0[2] + (c1[2] - c0[2]) * f))
+        return stops[-1][1]
+
     def _log_to_rerun(self, res_n: _ResN, dist_n: _DistN) -> None:
-        """Push a 3D point cloud of the tactile points to rerun, plus per-axis
-        resultant scalars. Safe no-op if rerun isn't running or the anatomy
-        coordinates weren't loaded."""
+        """Draw each taxel's (Fx, Fy, Fz) force as a 3D arrow (PXSR-style):
+        the arrow starts at the taxel position, points along the force vector,
+        and is colored by magnitude on a green->red scale. A faint static
+        point cloud shows the fingertip shape at rest. Plus per-axis resultant
+        scalars. Safe no-op if rerun isn't running or coords weren't loaded."""
         if self._rerun_coords is None or self._rerun_log_path is None:
             return
         try:
@@ -689,35 +707,37 @@ class PaxiniSensor(Sensor):
             return
         try:
             if not self._rerun_anatomy_logged:
-                # Faint backdrop so the fingertip shape is always visible.
-                pale = [(180, 185, 195)] * len(self._rerun_coords)
+                # Faint backdrop so the fingertip shape is always visible,
+                # even with no contact. Static so it's logged once.
+                pale = [(150, 155, 165)] * len(self._rerun_coords)
                 rr.log(
                     f"{self._rerun_log_path}/anatomy",
                     rr.Points3D(positions=self._rerun_coords,
-                                 colors=pale, radii=0.15),
+                                 colors=pale, radii=0.12),
                     static=True,
                 )
                 self._rerun_anatomy_logged = True
 
             if dist_n:
-                # High-contrast blue->red hue keyed to abs(Fz), saturating at
-                # 0.5 N so a light fingertip press already paints red. Radii
-                # blow up to 3.0 at saturation so contact area is obvious.
+                cfg = self.config
+                scale = float(getattr(cfg, "rerun_arrow_scale_mm_per_n", 2.0))
+                fmax = max(1e-6, float(getattr(cfg, "rerun_force_max_n", 10.0)))
+                thr = float(getattr(cfg, "rerun_force_threshold_n", 0.15))
                 n = min(len(dist_n), len(self._rerun_coords))
-                colors, radii = [], []
-                SAT_N = 0.5
+                origins, vectors, colors = [], [], []
                 for i in range(n):
-                    fz = abs(dist_n[i][2])
-                    t = max(0.0, min(1.0, fz / SAT_N))
-                    r = round(40 + (230 - 40) * t)
-                    g = round(110 + (40 - 110) * t)
-                    b = round(220 + (40 - 220) * t)
-                    colors.append((r, g, b))
-                    radii.append(0.3 + 2.7 * t)
+                    fx, fy, fz = dist_n[i]
+                    mag = (fx * fx + fy * fy + fz * fz) ** 0.5
+                    if mag < thr:
+                        continue  # skip near-zero taxels (noise)
+                    origins.append(self._rerun_coords[i])
+                    vectors.append((fx * scale, fy * scale, fz * scale))
+                    colors.append(self._force_colormap(mag / fmax))
+                # Log even when empty so released taxels clear their arrows.
                 rr.log(
-                    f"{self._rerun_log_path}/distributed",
-                    rr.Points3D(positions=self._rerun_coords[:n],
-                                 colors=colors, radii=radii),
+                    f"{self._rerun_log_path}/force_arrows",
+                    rr.Arrows3D(origins=origins, vectors=vectors,
+                                 colors=colors, radii=0.15),
                 )
 
             if res_n is not None:

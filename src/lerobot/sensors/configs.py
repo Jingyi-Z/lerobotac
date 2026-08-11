@@ -100,6 +100,16 @@ class PaxiniSensorConfig(SensorConfig):
     # isn't initialized yet, the calls silently no-op.
     display_rerun: bool = False
 
+    # Rerun force-arrow display tuning (used when display_rerun=True). Each
+    # taxel is drawn as a 3D arrow = its (Fx, Fy, Fz) force vector, colored by
+    # magnitude on a green->yellow->red scale like the PXSR host app.
+    #   rerun_arrow_scale_mm_per_n : arrow length in mm per newton of force.
+    #   rerun_force_max_n          : force magnitude (N) that saturates red.
+    #   rerun_force_threshold_n    : hide arrows below this magnitude (noise).
+    rerun_arrow_scale_mm_per_n: float = 2.0
+    rerun_force_max_n: float = 5.0
+    rerun_force_threshold_n: float = 0.15
+
     # Which communication board the sensor is attached to:
     #   "high_speed" -> High-Speed Communication Board: auto-push stream,
     #                   ~91 Hz, up to 28 modules, reports point counts.
