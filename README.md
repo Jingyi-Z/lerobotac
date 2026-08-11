@@ -55,17 +55,38 @@ Documentation lives in the companion repo:
 ### Sensor configuration
 
 Sensors are declared on the `so_sensor_follower` robot via `--robot.sensors`;
-each records into the dataset at `observation.sensors.<name>`. Both sensor
-types can be used at once. Example — a Paxini fingertip and an MLX gripper
-sensor together:
+each records into the dataset at `observation.sensors.<name>`. Any mix of
+sensor types and counts can be used at once. Example — a Paxini fingertip and
+an MLX gripper sensor together:
 
 ```
 --robot.sensors='{gripper: {type: mlx90393, port: /dev/cu.usbmodem197004501}, paxini_fingertip: {type: paxini, board_type: high_speed, port: /dev/cu.usbmodemD3BB68743E521, output_format: distributed, poll_rate_hz: 30}}'
 ```
 
-For the Paxini Serial Converter Board, set `board_type: serial` and supply
-`sensor_part_code` (that board cannot report its sensor model). See Doc #08
-for the full recording workflow.
+**Two (or more) Paxini fingertips on one High-Speed board.** The board carries
+up to 28 modules (finger segments + palm). Declare one entry per module, all
+on the same `port` with distinct `module_index` values; the instances share a
+single board and auto-push stream internally:
+
+```
+--robot.sensors='{paxini_gripper: {type: paxini, board_type: high_speed, port: COM10, module_index: 10, output_format: distributed, poll_rate_hz: 30, display_rerun: true}, paxini_wrist_roll: {type: paxini, board_type: high_speed, port: COM10, module_index: 18, output_format: distributed, poll_rate_hz: 30, display_rerun: true}}'
+```
+
+Each fingertip records to its own `observation.sensors.<name>` column
+(`(buffer_size, P, 3)` in `distributed` mode). Verified on hardware with two
+DP-S2015-Elite fingertips (modules 10 and 18) recorded together with two
+cameras and both SO-101 arms.
+
+**Serial Converter Board.** Set `board_type: serial` and supply
+`sensor_part_code` (that board cannot report its sensor model).
+
+**Live view.** With `--display_data=true` and `display_rerun: true`, the
+recorder shows a Paxini forces time-series plus one 3D point-cloud panel per
+fingertip. Multiple USB cameras on Windows may need `fourcc: MJPG` to avoid
+frame-drop timeouts from USB-bandwidth saturation.
+
+See [Doc #08](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/08_paxini_tactile_sensor.md)
+for the full recording workflow, the verified command, and the blocker table.
 
 ### Adding a new sensor
 
