@@ -322,6 +322,19 @@ def record_loop(
 
 
 @parser.wrap()
+def _notify_sensors(robot, method: str, *args) -> None:
+    """Invoke an optional per-episode hook on every sensor that has it
+    (e.g. PaxiniSensor's raw-CSV sidecar lifecycle). Sensors without the
+    hook are skipped; hook errors must never kill a recording."""
+    for name, sensor in (getattr(robot, "sensors", None) or {}).items():
+        fn = getattr(sensor, method, None)
+        if callable(fn):
+            try:
+                fn(*args)
+            except Exception as e:
+                logging.warning(f"sensor {name}.{method} failed: {e}")
+
+
 def record(
     cfg: RecordConfig,
     teleop_action_processor: RobotProcessorPipeline | None = None,
@@ -447,6 +460,8 @@ def record(
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                _notify_sensors(robot, "start_raw_episode",
+                                dataset.root, dataset.num_episodes)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -487,9 +502,11 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    _notify_sensors(robot, "discard_raw_episode")
                     continue
 
                 dataset.save_episode()
+                _notify_sensors(robot, "finish_raw_episode")
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)

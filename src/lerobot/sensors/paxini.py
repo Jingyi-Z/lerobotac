@@ -52,6 +52,7 @@ Both boards do firmware baseline subtraction via a ``calibrate()`` call;
 baseline can be layered on top via ``software_baseline_frames``.
 """
 
+import json
 import logging
 import threading
 import time
@@ -250,6 +251,70 @@ class _SharedHighSpeedBoard:
             logging.exception(f"Paxini: shared-board stream terminated: {e}")
 
 
+class _RawCsvWriter:
+    """Per-episode raw-stream sidecar writer, company-schema-compatible.
+
+    One CSV per finger:
+      <root>/sensors/<sensor_name>/episode_{i:06d}/<filename {n}>
+    Columns exactly match the company's 91 Hz files:
+      timestamp_ns, frame_status, time_calibration_offset_ns,
+      calibrated_timestamp_ns, fx, fy, fz, p_00_fx, ..., p_{P-1}_fz
+    plus an alignment.json with the episode-start epoch time — the anchor
+    needed to align the raw stream with the 30 Hz main table exactly
+    (the company format only allows first-sample alignment, ~1s off).
+
+    Written from the shared-board stream callback (~91 Hz x n_fingers);
+    rows are flushed per write so an aborted episode loses at most one row.
+    """
+
+    def __init__(self, root: str, sensor_name: str, episode_index: int,
+                 n_fingers: int, n_taxels: int, filename_template: str):
+        import os
+        self.dir = os.path.join(root, "sensors", sensor_name,
+                                f"episode_{episode_index:06d}")
+        os.makedirs(self.dir, exist_ok=True)
+        header = ["timestamp_ns", "frame_status",
+                  "time_calibration_offset_ns", "calibrated_timestamp_ns",
+                  "fx", "fy", "fz"]
+        for i in range(n_taxels):
+            header += [f"p_{i:02d}_fx", f"p_{i:02d}_fy", f"p_{i:02d}_fz"]
+        self._files = []
+        for k in range(n_fingers):
+            path = os.path.join(self.dir, filename_template.format(n=k + 1))
+            # utf-8-sig BOM matches the company files byte-for-byte
+            f = open(path, "w", encoding="utf-8-sig", newline="")
+            f.write(",".join(header) + "\n")
+            self._files.append(f)
+        with open(os.path.join(self.dir, "alignment.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"episode_start_timestamp_ns": time.time_ns(),
+                       "clock": "time.time_ns (epoch)",
+                       "note": "main-table frame 0 is captured at/after this "
+                               "instant; raw rows carry the same clock in "
+                               "calibrated_timestamp_ns"}, f, indent=2)
+
+    def write(self, finger: int, t_ns: int,
+              resultant, taxels) -> None:
+        f = self._files[finger]
+        row = [str(t_ns), "0", "0", str(t_ns)]
+        row += [f"{v:.1f}" for v in resultant]
+        for p in taxels:
+            row += [f"{p[0]:.1f}", f"{p[1]:.1f}", f"{p[2]:.1f}"]
+        f.write(",".join(row) + "\n")
+        f.flush()
+
+    def close(self, discard: bool = False) -> None:
+        import os, shutil
+        for f in self._files:
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._files = []
+        if discard:
+            shutil.rmtree(self.dir, ignore_errors=True)
+
+
 class PaxiniSensor(Sensor):
     """Driver for a Paxini PX-6AX GEN3 tactile sensor via paxini-sdk.
 
@@ -295,6 +360,13 @@ class PaxiniSensor(Sensor):
         self._period = 0.0
         self._last_ingest = 0.0
 
+        # ---- combined multi-finger mode (company format) ----
+        self._combined = config.output_format == "combined"
+        self._module_names: list[str] = []          # per finger, list order
+        self._latest_fingers: list[np.ndarray] | None = None
+        self._raw_writer: "_RawCsvWriter | None" = None
+        self._raw_lock = threading.Lock()
+
         # Optional software baseline (atop the firmware calibration)
         self._sw_baseline: Optional[np.ndarray] = None
         self._sw_baseline_buf: list[np.ndarray] = []
@@ -328,6 +400,10 @@ class PaxiniSensor(Sensor):
         if self._sample_dim is None:
             # Best-effort before connect(); finalized in connect().
             return (self.config.buffer_size, 3)
+        if self._combined:
+            # Combined mode has NO history buffer: one latest sample of
+            # shape (n_fingers, P, 3) per observation (company format).
+            return tuple(self._sample_dim)  # type: ignore[arg-type]
         if isinstance(self._sample_dim, tuple):
             return (self.config.buffer_size, *self._sample_dim)
         return (self.config.buffer_size, self._sample_dim)
@@ -362,13 +438,15 @@ class PaxiniSensor(Sensor):
             self._connect_high_speed()
 
         # Resolve the recorded-sample dimensionality from the point count.
-        if self.config.output_format == "resultant":
+        if self._combined:
+            self._sample_dim = (len(self._module_names), self._n_taxels, 3)  # type: ignore[assignment]
+        elif self.config.output_format == "resultant":
             self._sample_dim = 3
         elif self.config.output_format == "distributed":
             self._sample_dim = (self._n_taxels, 3)  # type: ignore[assignment]
         elif self.config.output_format == "both":
             self._sample_dim = 3 + self._n_taxels * 3
-        else:
+        elif not self._combined:
             raise ValueError(
                 f"Unsupported output_format: {self.config.output_format!r}"
             )
@@ -383,6 +461,10 @@ class PaxiniSensor(Sensor):
 
     def _connect_high_speed(self) -> None:
         from paxini_sdk import registers
+
+        if self._combined:
+            self._connect_combined()
+            return
 
         # Acquire (or create) the shared board for this port. The first sensor
         # on the port opens it and reads the active-modules list; later
@@ -420,6 +502,52 @@ class PaxiniSensor(Sensor):
                 self._shared.request_calibration()
         except Exception:
             # Don't leak a refcount if setup fails after acquire().
+            self._shared.release()
+            self._shared = None
+            raise
+
+    def _connect_combined(self) -> None:
+        """Combined multi-finger mode: one sensor claims ALL modules in
+        config.module_indices and emits (n_fingers, P, 3). Company-format
+        semantics: each observation is the LATEST raw sample per finger."""
+        from paxini_sdk import registers
+
+        idxs = self.config.module_indices
+        if not idxs:
+            raise RuntimeError(
+                "output_format='combined' requires module_indices, e.g. "
+                "module_indices: [10, 18] (finger order = list order)."
+            )
+        self._shared = _SharedHighSpeedBoard.acquire(
+            self.config.port, self.config.baud_rate
+        )
+        try:
+            active = self._shared.active_modules
+            missing = [m for m in idxs if m not in active]
+            if missing:
+                raise RuntimeError(
+                    f"Modules {missing} not active (active list: {active}). "
+                    "Check FPC cabling / slot assignment."
+                )
+            counts = {m: self._shared.point_count(m) for m in idxs}
+            if len(set(counts.values())) != 1:
+                raise RuntimeError(
+                    f"Mixed taxel counts across fingers not supported: {counts}"
+                )
+            self._n_taxels = counts[idxs[0]]
+            self._module_names = [registers.MODULE_NAMES[m] for m in idxs]
+            self._module_name = "+".join(self._module_names)
+            self._active_module_idx = idxs[0]
+            self._latest_fingers = [
+                np.zeros((self._n_taxels, 3), dtype=np.float32)
+                for _ in idxs
+            ]
+            for m, nm in zip(idxs, self._module_names):
+                self._shared.claim_module(m, f"{self._sensor_name or 'paxini'}[{nm}]")
+            if self.config.auto_calibrate:
+                logging.info("Paxini: triggering firmware calibration ...")
+                self._shared.request_calibration()
+        except Exception:
             self._shared.release()
             self._shared = None
             raise
@@ -487,6 +615,7 @@ class PaxiniSensor(Sensor):
                             "the display_rerun flag is a no-op.")
 
     def disconnect(self) -> None:
+        self.finish_raw_episode()
         self.stop_continuous_read()
         if self._board_type == "serial":
             if self._board is not None:
@@ -544,6 +673,30 @@ class PaxiniSensor(Sensor):
         Applies this sensor's poll-rate downsampling, extracts this sensor's
         module from the shared frame, and ingests it."""
         if self._stop_event.is_set():
+            return
+        if self._combined:
+            # Company-format mode: keep the latest (P, 3) grid per finger at
+            # the FULL stream rate (no downsampling — get_latest_data slices
+            # at observation time), and mirror every frame to the raw CSVs.
+            t_ns = time.time_ns()
+            for k, name in enumerate(self._module_names):
+                pts = frame.distributed_forces_newtons.get(name)
+                if pts:
+                    arr = np.asarray(pts, dtype=np.float32)
+                    if arr.shape[0] < self._n_taxels:
+                        arr = np.concatenate(
+                            [arr, np.zeros((self._n_taxels - arr.shape[0], 3),
+                                            dtype=np.float32)], axis=0)
+                    with self._data_lock:
+                        self._latest_fingers[k] = arr[: self._n_taxels]
+                res = frame.resultant_forces_newtons.get(name)
+                with self._raw_lock:
+                    if self._raw_writer is not None and pts:
+                        self._raw_writer.write(
+                            k, t_ns, res or (0.0, 0.0, 0.0),
+                            self._latest_fingers[k])
+                if self.config.display_rerun and k == 0:
+                    self._log_to_rerun(res, pts)
             return
         if self._period:
             now = time.monotonic()
@@ -759,6 +912,9 @@ class PaxiniSensor(Sensor):
             return None
         if not self.is_calibrated:
             return None
+        if self._combined:
+            with self._data_lock:
+                return np.stack(self._latest_fingers).astype(np.float32)
         with self._data_lock:
             samples = list(self._ring)
         if not samples:
@@ -782,6 +938,38 @@ class PaxiniSensor(Sensor):
             )
             return np.concatenate([pad, np.stack(samples)], axis=0)
         return np.stack(samples)
+
+    # ---- raw-CSV episode lifecycle (called by lerobot_record) --------------
+
+    def start_raw_episode(self, dataset_root, episode_index: int) -> None:
+        """Open per-finger raw CSVs for the episode about to be recorded.
+        No-op unless output_format='combined' and record_raw_csv=True."""
+        if not (self._combined and getattr(self.config, "record_raw_csv", False)):
+            return
+        with self._raw_lock:
+            if self._raw_writer is not None:
+                self._raw_writer.close()
+            self._raw_writer = _RawCsvWriter(
+                str(dataset_root), self._sensor_name or "paxini",
+                episode_index, len(self._module_names), self._n_taxels,
+                getattr(self.config, "raw_csv_filename", "sensor_{n}.csv"),
+            )
+        logging.info(
+            f"Paxini: raw CSV sidecar -> {self._raw_writer.dir}"
+        )
+
+    def finish_raw_episode(self) -> None:
+        with self._raw_lock:
+            if self._raw_writer is not None:
+                self._raw_writer.close()
+                self._raw_writer = None
+
+    def discard_raw_episode(self) -> None:
+        """Re-record: drop the episode's raw files entirely."""
+        with self._raw_lock:
+            if self._raw_writer is not None:
+                self._raw_writer.close(discard=True)
+                self._raw_writer = None
 
     def wait_for_calibration(self, timeout_s: float = 10.0, poll_s: float = 0.1) -> bool:
         deadline = time.monotonic() + timeout_s

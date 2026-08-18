@@ -137,3 +137,27 @@ class PaxiniSensorConfig(SensorConfig):
     # 0.0 = use the board's native rate (serial: as fast as it answers;
     # high-speed: the full ~91 Hz auto-push rate).
     poll_rate_hz: float = 0.0
+
+    # ---- Combined multi-finger mode (company-format datasets) --------------
+    # When set (High-Speed board only), ONE sensor entry reads ALL listed
+    # modules and emits a single (n_fingers, P, 3) tensor per observation --
+    # the latest raw sample per finger, no history buffer. This matches the
+    # company dataset field `observation.sensors.paxini_fingertip` (2, 52, 3).
+    # Finger order = list order (document finger 0/1 physically!). Requires
+    # output_format="combined".
+    module_indices: list[int] | None = None
+
+    # Write the native ~91 Hz raw stream to per-finger CSV sidecars during
+    # lerobot-record, mirroring the company layout:
+    #   <dataset_root>/sensors/<sensor_name>/episode_{i:06d}/传感器{n}.csv
+    # with their exact column schema (timestamp_ns, frame_status,
+    # time_calibration_offset_ns, calibrated_timestamp_ns, fx, fy, fz,
+    # p_00_fx ... p_{P-1}_fz) plus an alignment.json carrying the episode
+    # start time in epoch ns (the anchor the company format lacks).
+    record_raw_csv: bool = False
+
+    # Filename template for the raw CSVs ({n} = finger number, 1-based).
+    # ASCII by default; set to "传感器{n}.csv" if byte-level filename parity
+    # with the company's layout is ever needed (column schema matches either
+    # way, which is what their tools actually parse).
+    raw_csv_filename: str = "sensor_{n}.csv"

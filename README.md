@@ -45,6 +45,7 @@ Documentation lives in the companion repo:
 - Hardware setup and dataset workflow: [robotics_notes](https://github.com/Jingyi-Z/robotics_notes)
 - MLX90393 Hall sensor: [robotics_notes/docs/06_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/06_tactile_sensor.md)
 - Paxini PX-6AX GEN3 sensor: [robotics_notes/docs/08_paxini_tactile_sensor.md](https://github.com/Jingyi-Z/robotics_notes/blob/main/docs/08_paxini_tactile_sensor.md)
+- Dataset visualizer & annotator (tactile/RGBD-aware): [lerobotac-dataset-visualizer](https://huggingface.co/spaces/Jingyi-Z/lerobotac-dataset-visualizer)
 
 ### Branches
 
@@ -76,6 +77,23 @@ Each fingertip records to its own `observation.sensors.<name>` column
 (`(buffer_size, P, 3)` in `distributed` mode). Verified on hardware with two
 DP-S2015-Elite fingertips (modules 10 and 18) recorded together with two
 cameras and both SO-101 arms.
+
+**Company-format recording (combined mode + raw sidecar).** To produce
+datasets schema-compatible with our partner's format — one
+`observation.sensors.paxini_fingertip` field of shape `(n_fingers, P, 3)`
+(latest raw sample per finger, no history buffer) plus per-episode raw
+~91 Hz CSV sidecars with their exact column schema — use:
+
+```
+--robot.sensors='{paxini_fingertip: {type: paxini, board_type: high_speed, port: COM10, output_format: combined, module_indices: [10, 18], record_raw_csv: true}}'
+```
+
+Finger order = `module_indices` list order. Raw files land at
+`<dataset_root>/sensors/paxini_fingertip/episode_{i:06d}/sensor_{n}.csv`
+(columns: `timestamp_ns, frame_status, time_calibration_offset_ns,
+calibrated_timestamp_ns, fx, fy, fz, p_00_fx … p_{P-1}_fz`), together with
+an `alignment.json` carrying the episode-start epoch time for exact
+raw-to-30 Hz alignment. Sidecars are cleaned up automatically on re-record.
 
 **Serial Converter Board.** Set `board_type: serial` and supply
 `sensor_part_code` (that board cannot report its sensor model).
