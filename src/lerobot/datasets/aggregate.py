@@ -556,6 +556,37 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     return meta_idx
 
 
+def _sanitize_extension_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Make list-typed feature columns (e.g. (2,52,3) tactile arrays)
+    round-trippable through DataFrame.to_parquet across pandas/pyarrow
+    versions. Two failure modes handled:
+    - newer pandas reads them as Arrow-backed extension dtypes, which
+      to_parquet rejects (ArrowTypeError: 'Did not pass numpy.dtype object');
+    - object columns holding multi-dimensional np.ndarray cells, which some
+      pyarrow versions reject (ArrowInvalid: 'Can only convert 1-dimensional
+      array values'). Nested Python lists convert everywhere.
+    """
+    import numpy as np
+
+    def deep_tolist(v):
+        if isinstance(v, np.ndarray):
+            # .tolist() on an object ndarray keeps inner ndarrays intact,
+            # so recurse manually for those
+            if v.dtype == object:
+                return [deep_tolist(x) for x in v]
+            return v.tolist()
+        return v
+
+    for c in df.columns:
+        if not isinstance(df[c].dtype, np.dtype):
+            df[c] = pd.Series(list(df[c].to_numpy()), index=df.index, dtype=object)
+        if df[c].dtype == object and len(df):
+            first = df[c].iloc[0]
+            if isinstance(first, np.ndarray) and (first.ndim > 1 or first.dtype == object):
+                df[c] = df[c].map(deep_tolist)
+    return df
+
+
 def append_or_create_parquet_file(
     df: pd.DataFrame,
     src_path: Path,
@@ -587,6 +618,9 @@ def append_or_create_parquet_file(
         tuple: (updated_idx, (dst_chunk, dst_file)) where updated_idx is the index dict
                and (dst_chunk, dst_file) is the actual destination file the data was written to.
     """
+    if not contains_images:
+        df = _sanitize_extension_dtypes(df)
+
     dst_chunk, dst_file = idx["chunk"], idx["file"]
     dst_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
 
@@ -614,7 +648,7 @@ def append_or_create_parquet_file(
             existing_ds = datasets.Dataset.from_parquet(str(dst_path))
             existing_df = existing_ds.to_pandas()
         else:
-            existing_df = pd.read_parquet(dst_path)
+            existing_df = _sanitize_extension_dtypes(pd.read_parquet(dst_path))
         final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
 

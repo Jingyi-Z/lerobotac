@@ -506,6 +506,16 @@ def record(
                     _notify_sensors(robot, "discard_raw_episode")
                     continue
 
+                if not dataset.has_pending_frames():
+                    logging.warning(
+                        "Episode ended with 0 frames (stray early-exit keypress?) "
+                        "— discarding and re-recording."
+                    )
+                    dataset.clear_episode_buffer()
+                    _notify_sensors(robot, "discard_raw_episode")
+                    events["exit_early"] = False
+                    continue
+
                 dataset.save_episode()
                 _notify_sensors(robot, "finish_raw_episode")
                 recorded_episodes += 1

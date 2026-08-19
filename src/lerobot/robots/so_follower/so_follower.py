@@ -186,7 +186,13 @@ class SOFollower(Robot):
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.read_latest()
+            try:
+                obs_dict[cam_key] = cam.read_latest()
+            except TimeoutError as e:
+                # Transient stall (common on Windows USB cams): block for the
+                # next fresh frame instead of killing the recording session.
+                logger.warning(f"{self} {cam_key}: {e} Falling back to blocking read.")
+                obs_dict[cam_key] = cam.read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
