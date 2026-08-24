@@ -478,6 +478,11 @@ def record(
                     display_compressed_images=display_compressed_images,
                 )
 
+                # Close raw sidecars at episode end so they span exactly the
+                # episode (not the reset period). A re-record still discards
+                # the closed files via the sensor's remembered directory.
+                _notify_sensors(robot, "finish_raw_episode")
+
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and (
@@ -517,7 +522,6 @@ def record(
                     continue
 
                 dataset.save_episode()
-                _notify_sensors(robot, "finish_raw_episode")
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)

@@ -961,15 +961,25 @@ class PaxiniSensor(Sensor):
     def finish_raw_episode(self) -> None:
         with self._raw_lock:
             if self._raw_writer is not None:
+                # Remember the dir so a later re-record can still discard it
+                # (finish now runs at episode end, BEFORE the reset period,
+                # so the sidecar spans exactly the episode).
+                self._last_raw_dir = self._raw_writer.dir
                 self._raw_writer.close()
                 self._raw_writer = None
 
     def discard_raw_episode(self) -> None:
-        """Re-record: drop the episode's raw files entirely."""
+        """Re-record: drop the episode's raw files entirely (whether the
+        writer is still open or was already finished at episode end)."""
         with self._raw_lock:
             if self._raw_writer is not None:
                 self._raw_writer.close(discard=True)
                 self._raw_writer = None
+            elif getattr(self, "_last_raw_dir", None):
+                import shutil
+
+                shutil.rmtree(self._last_raw_dir, ignore_errors=True)
+                self._last_raw_dir = None
 
     def wait_for_calibration(self, timeout_s: float = 10.0, poll_s: float = 0.1) -> bool:
         deadline = time.monotonic() + timeout_s
