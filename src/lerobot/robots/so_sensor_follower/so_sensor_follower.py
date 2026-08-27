@@ -40,6 +40,10 @@ class SOSensorFollower(SOFollower):
         self.config: SOSensorFollowerConfig = config
 
         self._sensors = make_sensors_from_configs(config.sensors)
+        # Last good reading per sensor: transient read failures reuse this
+        # instead of injecting zero frames into the dataset (zeros look like
+        # contact loss and corrupt event detection downstream).
+        self._last_sensor_data: dict[str, np.ndarray] = {}
         for sensor_name, sensor in self._sensors.items():
             try:
                 sensor.connect()
@@ -58,21 +62,28 @@ class SOSensorFollower(SOFollower):
             try:
                 data = sensor.get_latest_data()
                 if data is None:
+                    last = self._last_sensor_data.get(sensor_name)
                     warnings.warn(
-                        f"Sensor '{sensor_name}' returned no data; substituting zeros.",
+                        f"Sensor '{sensor_name}' returned no data; reusing "
+                        f"{'last reading' if last is not None else 'zeros'}.",
                         RuntimeWarning,
                         stacklevel=2,
                     )
-                    data = np.zeros(sensor.shape, dtype=np.float32)
+                    data = last if last is not None else np.zeros(sensor.shape, dtype=np.float32)
+                else:
+                    self._last_sensor_data[sensor_name] = data
                 observation[obs_key] = data
             except Exception as e:
+                last = self._last_sensor_data.get(sensor_name)
                 warnings.warn(
                     f"Sensor '{sensor_name}' read raised {type(e).__name__}: {e}; "
-                    "substituting zeros.",
+                    f"reusing {'last reading' if last is not None else 'zeros'}.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                observation[obs_key] = np.zeros(sensor.shape, dtype=np.float32)
+                observation[obs_key] = (
+                    last if last is not None else np.zeros(sensor.shape, dtype=np.float32)
+                )
 
         return observation
 
