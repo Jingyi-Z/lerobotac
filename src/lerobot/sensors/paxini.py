@@ -681,15 +681,34 @@ class PaxiniSensor(Sensor):
             t_ns = time.time_ns()
             for k, name in enumerate(self._module_names):
                 pts = frame.distributed_forces_newtons.get(name)
+                res = frame.resultant_forces_newtons.get(name)
                 if pts:
                     arr = np.asarray(pts, dtype=np.float32)
                     if arr.shape[0] < self._n_taxels:
                         arr = np.concatenate(
                             [arr, np.zeros((self._n_taxels - arr.shape[0], 3),
                                             dtype=np.float32)], axis=0)
-                    with self._data_lock:
-                        self._latest_fingers[k] = arr[: self._n_taxels]
-                res = frame.resultant_forces_newtons.get(name)
+                    arr = arr[: self._n_taxels]
+                    # Firmware dropout guard: some auto-push frames carry a
+                    # valid resultant but an all-zero distributed block
+                    # (observed on sotac raw ep6 finger 0). Storing the zeros
+                    # fabricates a contact loss in both the 30 Hz table and
+                    # the raw CSVs — hold the last taxel frame instead.
+                    res_sq = (
+                        res[0] * res[0] + res[1] * res[1] + res[2] * res[2]
+                        if res
+                        else 0.0
+                    )
+                    if arr.any() or res_sq <= 0.04:
+                        with self._data_lock:
+                            self._latest_fingers[k] = arr
+                    else:
+                        self._dropout_frames = getattr(self, "_dropout_frames", 0) + 1
+                        if self._dropout_frames % 200 == 1:
+                            logging.warning(
+                                f"Paxini: zeroed distributed block with live resultant "
+                                f"({self._dropout_frames} frames so far) — holding last taxels"
+                            )
                 with self._raw_lock:
                     if self._raw_writer is not None and pts:
                         self._raw_writer.write(
